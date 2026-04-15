@@ -2,12 +2,7 @@
 ui/problem_ui.py
 ================
 Streamlit sidebar widgets for matrix A, vector b, and experiment axes.
-
-Matrix TYPE  = what the entries are (Random Gaussian, Hilbert, Toeplitz, …)
-Matrix STRUCTURE = sparsity pattern applied on top (Dense, Tridiagonal, …)
-
-These are orthogonal.  Block-Toeplitz is a type (not a structure) with its
-own block-size parameter.  The structure selectbox shows only sparsity options.
+Includes a CPU / GPU device selector at the top.
 """
 
 from __future__ import annotations
@@ -21,12 +16,13 @@ from core.problem_creation import (
     STRUCTURE_NOTES,
     _BASE_GENERATORS,
     compatible_structures,
+    load_npy,
 )
+from core.device import gpu_available, gpu_info
 
-MATRIX_TYPES  = list(_BASE_GENERATORS.keys())
+MATRIX_TYPES   = list(_BASE_GENERATORS.keys())
 ALL_STRUCTURES = list(STRUCTURE_NOTES.keys())
-
-_ALL_ORDERS = list(range(-16, 1))
+_ALL_ORDERS    = list(range(-16, 1))
 
 
 def _memory_estimate(m: int, dtype_label: str) -> str:
@@ -53,7 +49,6 @@ def _parse_order_list(raw: str) -> list[int] | None:
 
 
 def structure_label(name: str, param: int) -> str:
-    """Human-readable label for a sparsity structure + its sub-parameter."""
     if name == "Sparse Block-Tridiagonal":
         return f"Block-Tridiag (bs={param})"
     if name == "Sparse Banded":
@@ -62,7 +57,6 @@ def structure_label(name: str, param: int) -> str:
 
 
 def _render_struct_param(s_name: str, m_ref: int, key_suffix: str = "") -> int:
-    """Render the sub-parameter slider for structures that need one."""
     if s_name == "Sparse Block-Tridiagonal":
         max_bs = max(1, m_ref)
         return st.slider(
@@ -84,99 +78,192 @@ def _render_struct_param(s_name: str, m_ref: int, key_suffix: str = "") -> int:
     return 1
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Device selector  (rendered first in the sidebar)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_device_selector() -> bool:
+    """
+    Render the CPU / GPU device selector at the top of the sidebar.
+
+    Returns
+    -------
+    use_gpu : bool
+        True if the user has selected GPU and GPU is available.
+    """
+    st.header("⚙️ Device")
+
+    _gpu_avail = gpu_available()
+    _info      = gpu_info() if _gpu_avail else {}
+
+    if not _gpu_avail:
+        st.radio(
+            "Compute device",
+            ["CPU"],
+            index=0,
+            horizontal=True,
+            help="CuPy not found or no CUDA device available.  "
+                 "Install with:  pip install cupy-cuda12x",
+            disabled=True,
+        )
+        st.caption(
+            "🟡 GPU not available.  Install CuPy to enable:  "
+            "`pip install cupy-cuda12x`"
+        )
+        return False
+
+    # GPU is available — show toggle
+    device_choice = st.radio(
+        "Compute device",
+        ["CPU", "GPU"],
+        index=0,
+        horizontal=True,
+        help="GPU uses CuPy / cuSolver.  All solvers are supported.",
+    )
+    use_gpu = (device_choice == "GPU")
+
+    if use_gpu:
+        devices = _info.get("devices", [])
+        n       = _info.get("device_count", 0)
+        label   = devices[0] if devices else "Unknown GPU"
+        st.success(f"🟢 GPU  ·  {label}  ·  {n} device(s)")
+    else:
+        st.info("🔵 CPU  ·  NumPy / SciPy / LAPACK")
+
+    st.markdown("---")
+    return use_gpu
+
+
 def render_problem_ui() -> dict:
     """Render all problem-creation sidebar widgets and return parameter dict."""
 
+    # ── Device selector  (top of sidebar) ────────────────────────────────────
+    use_gpu = render_device_selector()
+
     # ═════════════════════════════════════════════════════════════════════════
-    # Matrix A
+    # Matrix A  +  optional import
     # ═════════════════════════════════════════════════════════════════════════
     st.header("Matrix A")
 
-    matrix_type = st.selectbox("Type", MATRIX_TYPES, index=0)
+    # ── Import toggle ─────────────────────────────────────────────────────────
+    import_A = st.checkbox("Import A from .npy file", value=False, key="import_A_cb")
 
-    note = MATRIX_TYPE_NOTES.get(matrix_type, "")
-    if note:
-        st.caption(note)
+    imported_A_array = None   # will hold the loaded numpy array if imported
 
-    # ── Seed ─────────────────────────────────────────────────────────────────
-    seed = 42
-    if matrix_type != "Hilbert":
-        seed = st.slider("Seed", min_value=0, max_value=100, value=42, step=1)
-
-    # ── Type-specific parameter ───────────────────────────────────────────────
-    type_param = 4   # default (block size for Block-Toeplitz)
-    if matrix_type in MATRIX_TYPE_PARAM_NOTES:
-        param_note = MATRIX_TYPE_PARAM_NOTES[matrix_type]
-        if matrix_type == "Block-Toeplitz":
-            # Block size is a type parameter, not a structure parameter
-            # (set before size m so the slider max is m-independent at first)
-            type_param = st.slider(
-                "Block size",
-                min_value=1, max_value=50, value=4,
-                help=param_note,
-            )
-        elif matrix_type == "Random SPD":
-            type_param = st.slider(
-                "log₁₀(κ_target)",
-                min_value=1, max_value=16, value=6,
-                help=param_note,
-            )
-            st.caption(f"Target condition number: 10^{type_param} = {10**type_param:.0e}")
-        elif matrix_type == "Diagonally Dominant":
-            type_param = st.slider(
-                "Diagonal margin",
-                min_value=1, max_value=50, value=1,
-                help=param_note,
-            )
-            st.caption(f"aᵢᵢ = Σ|aᵢⱼ| + {type_param}")
-
-    # ── Size m  (sweepable) ───────────────────────────────────────────────────
-    col_m, col_sw_m = st.columns([3, 1])
-    with col_m:
-        m = int(st.number_input("Size (m)", min_value=1, max_value=10_000,
-                                value=4, step=1))
-    with col_sw_m:
-        st.markdown("<br>", unsafe_allow_html=True)
-        sweep_m = st.checkbox("Sweep", key="sweep_m",
-                              help="Run for multiple sizes of m.")
-
-    m_values = [m]
-    if sweep_m:
-        raw_m    = st.text_input("Sizes (comma-separated)", value=str(m),
-                                 key="m_sweep_input", help="e.g. 4, 8, 16, 32")
-        parsed_m = _parse_int_list(raw_m, 1, 10_000)
-        if parsed_m is None:
-            st.warning("Enter valid integers between 1 and 10 000.")
+    if import_A:
+        uploaded_A = st.file_uploader(
+            "Upload A  (.npy)",
+            type=["npy"],
+            key="upload_A",
+            help="Save with:  np.save('A.npy', A)",
+        )
+        if uploaded_A is not None:
+            try:
+                imported_A_array = load_npy(uploaded_A, expected_ndim=2,
+                                            use_gpu=False)  # keep CPU for now
+                m, n = imported_A_array.shape
+                st.success(
+                    f"Loaded A: shape {m} × {n},  "
+                    f"dtype {imported_A_array.dtype},  "
+                    f"nnz {int((imported_A_array != 0).sum()):,}"
+                )
+            except Exception as e:
+                st.error(f"Could not load A: {e}")
+                imported_A_array = None
         else:
-            m_values = parsed_m
-        st.caption("✓ " + ",  ".join(str(v) for v in m_values))
+            st.info("Upload a .npy file to use a custom matrix.")
 
-    # ── Sparsity structure — filtered by compatibility ────────────────────────
-    allowed_structs = compatible_structures(matrix_type)
-    structure = st.selectbox("Structure", allowed_structs)
+    # ── Standard matrix controls (hidden when importing A) ────────────────────
+    matrix_type  = "Custom (imported)" if import_A else None
+    seed         = 42
+    type_param   = 4
+    m            = 4
+    structure    = "Dense"
+    struct_param = 1
 
-    struct_note = STRUCTURE_NOTES.get(structure, "")
-    if struct_note:
-        st.caption(struct_note)
+    if not import_A:
+        matrix_type = st.selectbox("Type", MATRIX_TYPES, index=0)
 
-    m_ref        = min(m_values)
-    struct_param = _render_struct_param(structure, m_ref)
+        note = MATRIX_TYPE_NOTES.get(matrix_type, "")
+        if note:
+            st.caption(note)
 
-    # ── Hermitian / Positive Definite ─────────────────────────────────────────
-    make_hermitian = st.checkbox("Hermitian  (A ← (A + Aᵀ) / 2)", value=False)
-    make_pd        = st.checkbox("Positive Definite  (A ← AᵀA + αI)", value=False)
+        if matrix_type != "Hilbert":
+            seed = st.slider("Seed", min_value=0, max_value=100, value=42, step=1)
 
-    # ── dtype ─────────────────────────────────────────────────────────────────
+        if matrix_type in MATRIX_TYPE_PARAM_NOTES:
+            param_note = MATRIX_TYPE_PARAM_NOTES[matrix_type]
+            if matrix_type == "Block-Toeplitz":
+                type_param = st.slider(
+                    "Block size", min_value=1, max_value=50, value=4,
+                    help=param_note,
+                )
+            elif matrix_type == "Random SPD":
+                type_param = st.slider(
+                    "log₁₀(κ_target)", min_value=1, max_value=16, value=6,
+                    help=param_note,
+                )
+                st.caption(f"Target condition number: 10^{type_param} = {10**type_param:.0e}")
+            elif matrix_type == "Diagonally Dominant":
+                type_param = st.slider(
+                    "Diagonal margin", min_value=1, max_value=50, value=1,
+                    help=param_note,
+                )
+                st.caption(f"aᵢᵢ = Σ|aᵢⱼ| + {type_param}")
+
+        col_m, col_sw_m = st.columns([3, 1])
+        with col_m:
+            m = int(st.number_input("Size (m)", min_value=1, max_value=10_000,
+                                    value=4, step=1))
+        with col_sw_m:
+            st.markdown("<br>", unsafe_allow_html=True)
+            sweep_m = st.checkbox("Sweep", key="sweep_m")
+
+        m_values = [m]
+        if sweep_m:
+            raw_m    = st.text_input("Sizes (comma-separated)", value=str(m),
+                                     key="m_sweep_input", help="e.g. 4, 8, 16, 32")
+            parsed_m = _parse_int_list(raw_m, 1, 10_000)
+            if parsed_m is None:
+                st.warning("Enter valid integers between 1 and 10 000.")
+            else:
+                m_values = parsed_m
+            st.caption("✓ " + ",  ".join(str(v) for v in m_values))
+
+        allowed_structs = compatible_structures(matrix_type)
+        structure = st.selectbox("Structure", allowed_structs)
+
+        struct_note = STRUCTURE_NOTES.get(structure, "")
+        if struct_note:
+            st.caption(struct_note)
+
+        m_ref        = min(m_values)
+        struct_param = _render_struct_param(structure, m_ref)
+
+        make_hermitian = st.checkbox("Hermitian  (A ← (A + Aᵀ) / 2)", value=False)
+        make_pd        = st.checkbox("Positive Definite  (A ← AᵀA + αI)", value=False)
+
+    else:
+        # When importing, these options are not applicable
+        m_values       = [imported_A_array.shape[0]] if imported_A_array is not None else [0]
+        sweep_m        = False
+        make_hermitian = False
+        make_pd        = False
+        m_ref          = m_values[0]
+        st.caption("ℹ️ Structure, size, and symmetry controls are disabled for imported matrices.")
+
+    # ── dtype (always shown) ──────────────────────────────────────────────────
     dtype_A_label = st.radio("A dtype",
                              ["float64  (double)", "float32  (single)"],
                              horizontal=True)
     dtype_A = np.float64 if "64" in dtype_A_label else np.float32
 
-    mem = _memory_estimate(m, dtype_A_label)
-    if m ** 2 * (8 if "64" in dtype_A_label else 4) > 400_000_000:
-        st.warning(f"Estimated dense allocation: **{mem}** — may be slow or OOM.")
-    else:
-        st.caption(f"Estimated dense memory: {mem}")
+    if not import_A:
+        mem = _memory_estimate(m_values[0], dtype_A_label)
+        if m_values[0] ** 2 * (8 if "64" in dtype_A_label else 4) > 400_000_000:
+            st.warning(f"Estimated dense allocation: **{mem}** — may be slow or OOM.")
+        else:
+            st.caption(f"Estimated dense memory: {mem}")
 
     # ═════════════════════════════════════════════════════════════════════════
     # Perturbation
@@ -193,8 +280,7 @@ def render_problem_ui() -> dict:
         col_oA, col_sw_oA = st.columns([3, 1])
         with col_oA:
             perturb_A_order = st.slider("Order (A)  [10^k · ‖A‖]",
-                                        min_value=-16, max_value=0, value=-6,
-                                        help="Adds noise of magnitude 10^k × ‖A‖.")
+                                        min_value=-16, max_value=0, value=-6)
         with col_sw_oA:
             st.markdown("<br>", unsafe_allow_html=True)
             sweep_order_A = st.checkbox("Sweep", key="sweep_oA")
@@ -203,8 +289,7 @@ def render_problem_ui() -> dict:
         if sweep_order_A:
             raw_oA    = st.text_input("Orders A (comma-separated, −16 to 0)",
                                       value=str(int(perturb_A_order)),
-                                      key="oA_sweep_input",
-                                      help="e.g. -16, -12, -8, -4")
+                                      key="oA_sweep_input")
             parsed_oA = _parse_order_list(raw_oA)
             if parsed_oA is None:
                 st.warning("Enter integers between −16 and 0.")
@@ -214,14 +299,44 @@ def render_problem_ui() -> dict:
         else:
             st.caption(f"Perturbation magnitude ≈ 10^{perturb_A_order} × ‖A‖")
 
-    # ── Vector b ──────────────────────────────────────────────────────────────
     st.markdown("---")
     st.header("Vector b")
 
-    dtype_b_label = st.radio("b dtype",
-                             ["float64  (double)", "float32  (single)"],
-                             horizontal=True)
-    dtype_b = np.float64 if "64" in dtype_b_label else np.float32
+    # ── Import toggle ─────────────────────────────────────────────────────────
+    import_b = st.checkbox("Import b from .npy file", value=False, key="import_b_cb")
+
+    imported_b_array = None
+
+    if import_b:
+        uploaded_b = st.file_uploader(
+            "Upload b  (.npy)",
+            type=["npy"],
+            key="upload_b",
+            help="Save with:  np.save('b.npy', b)",
+        )
+        if uploaded_b is not None:
+            try:
+                imported_b_array = load_npy(uploaded_b, expected_ndim=1,
+                                            use_gpu=False)
+                st.success(
+                    f"Loaded b: length {imported_b_array.shape[0]},  "
+                    f"dtype {imported_b_array.dtype}"
+                )
+            except Exception as e:
+                st.error(f"Could not load b: {e}")
+                imported_b_array = None
+        else:
+            st.info("Upload a .npy file to use a custom vector b.")
+
+    # ── dtype (shown when not importing) ──────────────────────────────────────
+    dtype_b = np.float64
+    if not import_b:
+        dtype_b_label = st.radio("b dtype",
+                                 ["float64  (double)", "float32  (single)"],
+                                 horizontal=True)
+        dtype_b = np.float64 if "64" in dtype_b_label else np.float32
+    else:
+        st.caption("ℹ️ dtype is read from the imported file.")
 
     perturb_b       = st.checkbox("Perturb b", value=False)
     perturb_b_order = -6
@@ -241,8 +356,7 @@ def render_problem_ui() -> dict:
         if sweep_order_b:
             raw_ob    = st.text_input("Orders b (comma-separated, −16 to 0)",
                                       value=str(int(perturb_b_order)),
-                                      key="ob_sweep_input",
-                                      help="e.g. -16, -12, -8, -4")
+                                      key="ob_sweep_input")
             parsed_ob = _parse_order_list(raw_ob)
             if parsed_ob is None:
                 st.warning("Enter integers between −16 and 0.")
@@ -269,7 +383,6 @@ def render_problem_ui() -> dict:
         key="compare_axis_radio",
     )
 
-    # ── Matrix type compare ───────────────────────────────────────────────────
     matrix_type_values = [matrix_type]
     if compare_axis_label == "Matrix type":
         matrix_type_values = st.multiselect(
@@ -290,11 +403,9 @@ def render_problem_ui() -> dict:
             )
         st.caption("✓ " + ",  ".join(matrix_type_values))
 
-    # ── Structure compare ─────────────────────────────────────────────────────
     structure_values = [{"name": structure, "param": struct_param}]
-
     if compare_axis_label == "Structure":
-        struct_options = compatible_structures(matrix_type)
+        struct_options   = compatible_structures(matrix_type)
         selected_structs = st.multiselect(
             "Structures to compare",
             options = struct_options,
@@ -314,10 +425,9 @@ def render_problem_ui() -> dict:
             structure_label(sv["name"], sv["param"]) for sv in structure_values
         ))
 
-    _axis_map = {"None": None, "Matrix type": "matrix_type", "Structure": "structure"}
+    _axis_map        = {"None": None, "Matrix type": "matrix_type", "Structure": "structure"}
     compare_axis_key = _axis_map[compare_axis_label]
 
-    # ── Primary sweep axis ────────────────────────────────────────────────────
     active_sweeps = []
     if sweep_m       and len(m_values)       > 1: active_sweeps.append("m")
     if sweep_order_A and len(order_A_values) > 1: active_sweeps.append("perturb_A_order")
@@ -329,21 +439,27 @@ def render_problem_ui() -> dict:
     sweep_param = active_sweeps[0] if active_sweeps else None
 
     return {
-        "matrix_type":     matrix_type,
-        "seed":            seed,
-        "type_param":      int(type_param),
-        "m":               m,
-        "n":               m,
-        "structure":       structure,
-        "struct_param":    int(struct_param),
-        "make_hermitian":  make_hermitian,
-        "make_pd":         make_pd,
-        "dtype_A":         dtype_A,
-        "perturb_A":       perturb_A,
-        "perturb_A_order": int(perturb_A_order),
-        "dtype_b":         dtype_b,
-        "perturb_b":       perturb_b,
-        "perturb_b_order": int(perturb_b_order),
+        "matrix_type":       matrix_type,
+        "seed":              seed,
+        "type_param":        int(type_param),
+        "m":                 m_values[0],
+        "n":                 m_values[0],
+        "structure":         structure,
+        "struct_param":      int(struct_param),
+        "make_hermitian":    make_hermitian,
+        "make_pd":           make_pd,
+        "dtype_A":           dtype_A,
+        "perturb_A":         perturb_A,
+        "perturb_A_order":   int(perturb_A_order),
+        "dtype_b":           dtype_b,
+        "perturb_b":         perturb_b,
+        "perturb_b_order":   int(perturb_b_order),
+        "use_gpu":           use_gpu,
+        # Import fields
+        "import_A":          import_A,
+        "imported_A_array":  imported_A_array,   # numpy array or None
+        "import_b":          import_b,
+        "imported_b_array":  imported_b_array,   # numpy array or None
         "sweep": {
             "param":          sweep_param,
             "m_values":       m_values,

@@ -3,63 +3,33 @@ core/problem_creation.py
 ========================
 Generates the coefficient matrix A and right-hand side vector b for Ax = b.
 
+GPU support
+-----------
+All public functions accept an optional ``use_gpu`` boolean (default False).
+When True, arrays are allocated and returned as CuPy arrays on the current
+CUDA device.  The internal ``xp`` variable holds either ``numpy`` or ``cupy``
+depending on the device choice.
+
+Base generators run on the CPU using NumPy, then the result is transferred to
+the GPU via ``xp.asarray()``.  This is intentional: the matrix generation
+logic is algebraically complex (Toeplitz, Block-Toeplitz, Circulant, etc.) and
+the transfer cost is negligible for the matrix sizes used in this lab.  The
+performance-critical operations (factorisation, iterative solve) run on the GPU.
+
 Public API
 ----------
-create_matrix(...)          -> np.ndarray
-create_rhs(...)             -> np.ndarray
-apply_perturbation(...)     -> np.ndarray
-matrix_info(...)            -> dict
+create_matrix(...)          -> np.ndarray  or  cp.ndarray
+create_rhs(...)             -> np.ndarray  or  cp.ndarray
+apply_perturbation(...)     -> np.ndarray  or  cp.ndarray
+matrix_info(...)            -> dict  (always CPU scalars)
 compatible_structures(type) -> list[str]
-
-Design principle
-----------------
-Matrix TYPE defines the entry values and their algebraic structure.
-Matrix STRUCTURE defines the sparsity pattern (which entries are zero).
-
-These are orthogonal concepts — a Toeplitz matrix can be dense or tridiagonal;
-a Random Gaussian matrix can be dense or banded.  The exception is Random SPD,
-whose positive definiteness is destroyed by any sparsity pattern, so it is
-restricted to Dense only.
-
-Matrix types
-------------
-Random Gaussian      Entries i.i.d. N(0,1).  κ ~ O(n).  General benchmark.
-Hilbert              H[i,j] = 1/(i+j+1).  κ ~ (3.5)^n.  Ill-conditioned SPD.
-Toeplitz             Constant along each diagonal.  Built directly from a first
-                     row/column drawn from a decaying cosine sequence.
-                     Appears in convolution, time-series, 1-D FDM stencils.
-Block-Toeplitz       Built directly from independent random blocks B_0,…,B_{p-1}
-                     for the first block-row and B_{-1},…,B_{-(q-1)} for the
-                     first block-column, then tiled: T_{ij} = B_{j-i}.
-                     param = block size.  Appears in 2-D PDE discretisations
-                     and multi-channel signal processing.
-Circulant            Each row is a cyclic shift of the first.  Eigenvalues = DFT
-                     of first row.  Appears in periodic BC problems.
-Random SPD           A = QΛQᵀ with prescribed κ = 10^type_param.  Dense only.
-Diagonally Dominant  aᵢᵢ = Σ|aᵢⱼ| + margin.  Nonsingular by Gershgorin.
-                     Appears in FDM of elliptic PDEs.
-
-Structures (sparsity patterns only)
-------------------------------------
-Dense                All entries retained.
-Sparse Tridiagonal   Diagonals -1, 0, +1 only.
-Sparse Block-Tridiagonal  Main block-diagonal + two neighbouring blocks.
-Sparse Banded        param diagonals centred on main diagonal.
-
-Compatibility
--------------
-Random Gaussian      : all structures
-Hilbert              : all structures
-Toeplitz             : all structures
-Block-Toeplitz       : all structures
-Circulant            : all structures
-Random SPD           : Dense only  (sparse zeroing destroys SPD)
-Diagonally Dominant  : all structures
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+from core.device import get_array_module, to_numpy
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -85,49 +55,30 @@ COMPATIBILITY: dict[str, list[str]] = {
 
 
 def compatible_structures(matrix_type: str) -> list[str]:
-    """Return the list of valid sparsity structures for the given matrix type."""
     return COMPATIBILITY.get(matrix_type, _SPARSE_STRUCTURES)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Base matrix generators
+# Base matrix generators  (always produce numpy arrays — cheap CPU logic)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _random_gaussian(m: int, n: int, seed: int = 42, **_) -> np.ndarray:
-    """Entries i.i.d. N(0,1).  Expected κ ~ O(n)."""
     return np.random.default_rng(seed).standard_normal((m, n))
 
 
 def _hilbert(m: int, n: int, **_) -> np.ndarray:
-    """H[i,j] = 1/(i+j+1).  κ ~ (3.5)^min(m,n)."""
     i = np.arange(m, dtype=np.float64).reshape(-1, 1)
     j = np.arange(n, dtype=np.float64).reshape(1, -1)
     return 1.0 / (i + j + 1.0)
 
 
 def _toeplitz(m: int, n: int, seed: int = 42, **_) -> np.ndarray:
-    """
-    Scalar Toeplitz matrix: T[i,j] = f(j - i).
-
-    The generating function f is built from a decaying cosine sequence with a
-    seed-dependent phase shift:
-        f[k] = cos(k + phase) * exp(-|k| / 4)
-
-    The result is a true Toeplitz matrix (constant along every diagonal)
-    built directly from its first row and first column — no post-processing.
-    """
     rng   = np.random.default_rng(seed)
     phase = rng.uniform(0, 2 * np.pi)
-
-    # f[k] for k = 0, 1, ..., max(m,n)-1
     max_k = max(m, n)
     k     = np.arange(max_k, dtype=np.float64)
     f     = np.cos(k + phase) * np.exp(-k / 4.0)
-
-    # Build T[i,j] = f[|j-i|] using the sign convention f[-k] = f[k]
-    # (i.e. symmetric Toeplitz).  For a non-symmetric version pass a separate
-    # first column; here we keep it symmetric for clarity.
-    A = np.zeros((m, n), dtype=np.float64)
+    A     = np.zeros((m, n), dtype=np.float64)
     for i in range(m):
         for j in range(n):
             A[i, j] = f[abs(j - i)]
@@ -136,34 +87,13 @@ def _toeplitz(m: int, n: int, seed: int = 42, **_) -> np.ndarray:
 
 def _block_toeplitz(m: int, n: int, seed: int = 42,
                     type_param: int = 4, **_) -> np.ndarray:
-    """
-    Block-Toeplitz matrix built directly from independent random blocks.
-
-    A Block-Toeplitz matrix is defined by its first block-row and first
-    block-column:
-        T[br, bc] = B[bc - br]
-
-    where B[k] for k >= 0 comes from the first block-row, and B[k] for k < 0
-    comes from the first block-column.  Each block B[k] is an independent
-    random Gaussian block of size bs × bs.
-
-    This is the mathematically correct construction — no projection, no tiling
-    of a structured matrix, no ambiguity.
-
-    type_param = block size (bs).  Defaults to 4.
-    """
     bs     = max(1, int(type_param))
     rng    = np.random.default_rng(seed)
     num_rb = (m + bs - 1) // bs
     num_cb = (n + bs - 1) // bs
-
-    # Generate independent random blocks for each distinct offset d = bc - br
-    # d ranges from -(num_rb-1) to +(num_cb-1)
     blocks: dict[int, np.ndarray] = {}
     for d in range(-(num_rb - 1), num_cb):
         blocks[d] = rng.standard_normal((bs, bs))
-
-    # Tile
     A = np.zeros((m, n), dtype=np.float64)
     for br in range(num_rb):
         for bc in range(num_cb):
@@ -177,12 +107,6 @@ def _block_toeplitz(m: int, n: int, seed: int = 42,
 
 
 def _circulant(m: int, n: int, seed: int = 42, **_) -> np.ndarray:
-    """
-    Circulant matrix: each row is a cyclic shift of the first row.
-
-    The first row has a Gaussian envelope so the spectrum decays naturally.
-    Always square (k = min(m, n)).
-    """
     k   = min(m, n)
     rng = np.random.default_rng(seed)
     c   = rng.standard_normal(k) * np.exp(-np.arange(k, dtype=float) / (k / 4.0))
@@ -196,11 +120,6 @@ def _circulant(m: int, n: int, seed: int = 42, **_) -> np.ndarray:
 
 def _random_spd(m: int, n: int, seed: int = 42,
                 type_param: int = 6, **_) -> np.ndarray:
-    """
-    Random SPD matrix with prescribed κ(A) = 10^type_param.
-
-        A = Q Λ Qᵀ,  Q random orthogonal,  Λ = logspace(0, type_param, k)
-    """
     k    = min(m, n)
     rng  = np.random.default_rng(seed)
     Q, _ = np.linalg.qr(rng.standard_normal((k, k)))
@@ -213,14 +132,6 @@ def _random_spd(m: int, n: int, seed: int = 42,
 
 def _diagonally_dominant(m: int, n: int, seed: int = 42,
                           type_param: int = 1, **_) -> np.ndarray:
-    """
-    Strictly diagonally dominant random matrix.
-
-        aᵢᵢ = Σⱼ≠ᵢ |aᵢⱼ| + margin,   margin = type_param ≥ 1
-
-    Gershgorin guarantees non-singularity.  Sparse structures only
-    remove off-diagonal entries, which strengthens diagonal dominance.
-    """
     rng = np.random.default_rng(seed)
     A   = rng.standard_normal((m, n))
     k   = min(m, n)
@@ -240,7 +151,6 @@ _BASE_GENERATORS: dict[str, callable] = {
     "Diagonally Dominant": _diagonally_dominant,
 }
 
-# Human-readable notes shown in the UI
 MATRIX_TYPE_NOTES: dict[str, str] = {
     "Random Gaussian": (
         "Entries i.i.d. N(0,1).  κ(A) ~ O(n).  Standard benchmark."
@@ -280,7 +190,7 @@ MATRIX_TYPE_PARAM_NOTES: dict[str, str] = {
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sparsity structure masks
+# Sparsity structure masks  (NumPy — cheap, always CPU)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _tridiagonal_mask(m: int, n: int) -> np.ndarray:
@@ -316,9 +226,9 @@ def _banded_mask(m: int, n: int, num_diags: int) -> np.ndarray:
     return mask
 
 
-def _apply_structure(A: np.ndarray, structure: str,
-                     struct_param: int) -> np.ndarray:
-    """Apply a sparsity pattern to A by zeroing entries outside the pattern."""
+def _apply_structure_numpy(A: np.ndarray, structure: str,
+                            struct_param: int) -> np.ndarray:
+    """Apply a sparsity pattern.  Always operates on NumPy arrays."""
     if structure == "Dense":
         return A.copy()
     m, n = A.shape
@@ -341,14 +251,14 @@ STRUCTURE_NOTES: dict[str, str] = {
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Matrix modifications
+# Matrix modifications  (NumPy)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _symmetrize(A: np.ndarray) -> np.ndarray:
+def _symmetrize_numpy(A: np.ndarray) -> np.ndarray:
     return (A + A.T) / 2.0
 
 
-def _make_spd(A: np.ndarray) -> np.ndarray:
+def _make_spd_numpy(A: np.ndarray) -> np.ndarray:
     n     = A.shape[1]
     B     = A.T @ A
     alpha = n * np.finfo(np.float64).eps * np.linalg.norm(B, 1) + 1e-10
@@ -371,27 +281,19 @@ def create_matrix(
     dtype: np.dtype,
     seed: int = 42,
     type_param: int = 4,
-) -> np.ndarray:
+    use_gpu: bool = False,
+):
     """
     Construct the coefficient matrix A.
 
+    When ``use_gpu=True`` the returned array is a CuPy array on the GPU.
+    Generation always happens on the CPU (NumPy) and is then transferred.
+
     Parameters
     ----------
-    matrix_type           : one of the keys in _BASE_GENERATORS
-    m, n                  : rows and columns
-    structure             : sparsity pattern ("Dense" | "Sparse Tridiagonal" |
-                            "Sparse Block-Tridiagonal" | "Sparse Banded")
-    struct_param          : block size (Block-Tridiagonal) or num diagonals (Banded)
-    make_hermitian        : symmetrise via (A + Aᵀ) / 2
-    make_positive_definite: transform A → Aᵀ A + α I
-    dtype                 : np.float32 or np.float64
-    seed                  : RNG seed
-    type_param            : type-specific parameter:
-                            Block-Toeplitz      → block size
-                            Random SPD          → log₁₀(κ_target)
-                            Diagonally Dominant → diagonal margin
-
-    Raises ValueError for incompatible (matrix_type, structure) combinations.
+    use_gpu : bool
+        Transfer the final matrix to the GPU after generation.
+    (all other parameters identical to CPU version)
     """
     generator = _BASE_GENERATORS.get(matrix_type)
     if generator is None:
@@ -404,63 +306,152 @@ def create_matrix(
             f"Allowed: {allowed}"
         )
 
+    # Generate on CPU
     A = generator(m, n, seed=seed, type_param=type_param)
-    A = _apply_structure(A, structure, struct_param)
+    A = _apply_structure_numpy(A, structure, struct_param)
 
     if make_hermitian:
-        A = _symmetrize(A)
+        A = _symmetrize_numpy(A)
     if make_positive_definite:
-        A = _make_spd(A)
+        A = _make_spd_numpy(A)
 
-    return A.astype(dtype)
+    A = A.astype(dtype)
+
+    # Transfer to GPU if requested
+    if use_gpu:
+        xp = get_array_module(use_gpu=True)
+        return xp.asarray(A)
+    return A
 
 
-def create_rhs(m: int, dtype: np.dtype, seed: int = 7) -> np.ndarray:
+def create_rhs(m: int, dtype: np.dtype, seed: int = 7,
+               use_gpu: bool = False):
     """Random Gaussian right-hand side vector b of length m."""
-    return np.random.default_rng(seed).standard_normal(m).astype(dtype)
+    b = np.random.default_rng(seed).standard_normal(m).astype(dtype)
+    if use_gpu:
+        xp = get_array_module(use_gpu=True)
+        return xp.asarray(b)
+    return b
 
 
 def apply_perturbation(
-    arr: np.ndarray,
+    arr,
     order: int,
     seed: int = 13,
     structure: str = "Dense",
     struct_param: int = 1,
     make_hermitian: bool = False,
     make_positive_definite: bool = False,
-) -> np.ndarray:
+    use_gpu: bool = False,
+    custom_mask: np.ndarray | None = None,
+):
     """
     Add a structure-aware random perturbation with magnitude 10^order × ‖arr‖.
-    """
-    rng   = np.random.default_rng(seed)
-    noise = rng.standard_normal(arr.shape)
 
-    if arr.ndim == 2:
-        noise = _apply_structure(noise, structure, struct_param)
+    Works whether ``arr`` is a NumPy or CuPy array.  The perturbation is
+    generated on the CPU and transferred if needed.
+
+    Parameters
+    ----------
+    custom_mask : np.ndarray | None
+        Boolean mask of the same shape as arr.  When provided (for imported
+        matrices), noise is zeroed outside the mask so the perturbation
+        inherits the sparsity pattern of the original array.  Overrides
+        the ``structure`` / ``struct_param`` arguments.
+    """
+    arr_cpu = to_numpy(arr)
+    rng     = np.random.default_rng(seed)
+    noise   = rng.standard_normal(arr_cpu.shape)
+
+    if arr_cpu.ndim == 2:
+        if custom_mask is not None:
+            # Imported matrix: inherit sparsity pattern from the array itself
+            noise = noise * custom_mask.astype(float)
+        else:
+            noise = _apply_structure_numpy(noise, structure, struct_param)
         if make_hermitian:
-            noise = _symmetrize(noise)
+            noise = _symmetrize_numpy(noise)
         if make_positive_definite:
-            noise = _symmetrize(noise)
+            noise = _symmetrize_numpy(noise)
 
     noise_norm = np.linalg.norm(noise)
-    arr_norm   = np.linalg.norm(arr)
+    arr_norm   = np.linalg.norm(arr_cpu)
     if noise_norm > 0 and arr_norm > 0:
         noise = noise * (arr_norm * (10.0 ** order) / noise_norm)
     else:
         noise = noise * (10.0 ** order)
 
-    return (arr + noise).astype(arr.dtype)
+    result_cpu = (arr_cpu + noise).astype(arr_cpu.dtype)
+
+    if use_gpu:
+        xp = get_array_module(use_gpu=True)
+        return xp.asarray(result_cpu)
+    return result_cpu
 
 
-def matrix_info(A: np.ndarray) -> dict:
-    """Basic descriptive statistics for a dense matrix A."""
-    m, n  = A.shape
-    nnz   = int(np.count_nonzero(A))
+def load_npy(file_obj, expected_ndim: int, use_gpu: bool = False):
+    """
+    Load a .npy file uploaded via Streamlit and return a numpy or cupy array.
+
+    Parameters
+    ----------
+    file_obj    : file-like object from st.file_uploader
+    expected_ndim : 1 for vectors, 2 for matrices
+    use_gpu     : transfer to GPU after loading
+
+    Returns
+    -------
+    arr : np.ndarray or cp.ndarray
+
+    Raises
+    ------
+    ValueError  if the array has the wrong number of dimensions or
+                contains non-finite values.
+    """
+    import io
+    arr = np.load(io.BytesIO(file_obj.read()))
+
+    if arr.ndim != expected_ndim:
+        raise ValueError(
+            f"Expected a {expected_ndim}-D array but got shape {arr.shape}."
+        )
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Imported array contains NaN or Inf values.")
+
+    # Ensure float dtype
+    if not np.issubdtype(arr.dtype, np.floating):
+        arr = arr.astype(np.float64)
+
+    if use_gpu:
+        xp = get_array_module(use_gpu=True)
+        return xp.asarray(arr)
+    return arr
+
+
+def sparsity_mask(A) -> np.ndarray:
+    """
+    Return a boolean mask of the non-zero entries of A (CPU numpy).
+    Used to inherit the sparsity pattern of an imported matrix for perturbation.
+    """
+    A_cpu = to_numpy(A)
+    return A_cpu != 0.0
+
+
+def matrix_info(A) -> dict:
+    """
+    Basic descriptive statistics for a dense matrix A.
+
+    Works for both NumPy and CuPy arrays.  All returned values are
+    plain Python scalars so they are safe to display in Streamlit.
+    """
+    A_cpu = to_numpy(A)
+    m, n  = A_cpu.shape
+    nnz   = int(np.count_nonzero(A_cpu))
     total = m * n
     return {
         "shape":        (m, n),
-        "dtype":        str(A.dtype),
+        "dtype":        str(A_cpu.dtype),
         "nnz":          nnz,
         "density":      nnz / total if total > 0 else 0.0,
-        "memory_bytes": A.nbytes,
+        "memory_bytes": A_cpu.nbytes,
     }

@@ -3,27 +3,9 @@ app.py
 ======
 Numerical Linear Algebra Lab — main Streamlit entry point.
 
-Run with:
-    streamlit run app.py
-
-Experiment dimensions
----------------------
-Sweep   (x-axis of plots) — one of: m, perturb_A_order, perturb_b_order
-Compare (legend of plots) — one of: matrix_type, structure, solver  (or None)
-
-The full experiment is:
-
-    series  = compare_values  (one per legend entry)
-    instances per series = product(m_values, order_A_values, order_b_values)
-
-Results are stored in st.session_state.series_list, a list of:
-    {
-        "label"    : str          — legend label for this series
-        "instances": list[dict]   — one instance per sweep combo
-    }
-
-Sections 1 and 2 show the first series / first instance by default;
-the user selects via dropdowns.  Sections 3 and 4 draw one line per series.
+GPU support is threaded through via prob_params["use_gpu"].
+All matrices, vectors and solutions live on the chosen device;
+``device.to_numpy`` is called before any display / plot operation.
 """
 
 from __future__ import annotations
@@ -37,10 +19,11 @@ import streamlit as st
 
 from core.problem_creation import (
     create_matrix, create_rhs, apply_perturbation, matrix_info,
-    compatible_structures,
+    compatible_structures, sparsity_mask,
 )
 from core.solvers import SOLVERS
 from core.analysis import stability_analysis
+from core.device import to_numpy, gpu_available, gpu_info
 from ui.problem_ui import render_problem_ui, structure_label
 from ui.solver_ui import render_solver_ui
 from ui.analysis_ui import (
@@ -53,7 +36,6 @@ from ui.analysis_ui import (
     _bytes_to_human,
 )
 
-# Colour palette for compare series — enough for 10 series
 _SERIES_COLORS = [
     "#2980b9", "#e74c3c", "#27ae60", "#8e44ad",
     "#e67e22", "#16a085", "#c0392b", "#2c3e50",
@@ -79,13 +61,11 @@ st.caption(
 # ──────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    prob_params   = render_problem_ui()
+    prob_params   = render_problem_ui()   # now includes use_gpu
     solver_params = render_solver_ui()
 
     st.markdown("---")
 
-    # Resolve compare axis — problem_ui and solver_ui each contribute one axis;
-    # only one should be active at a time.
     p_compare = prob_params["compare"]
     s_compare = solver_params["compare"]
 
@@ -96,7 +76,6 @@ with st.sidebar:
         )
         s_compare = {"axis": None, "solver_values": [solver_params["solver_name"]]}
 
-    # Merged compare config — one authoritative dict
     if p_compare["axis"]:
         compare = p_compare
         compare["solver_values"] = [solver_params["solver_name"]]
@@ -122,7 +101,6 @@ with st.sidebar:
               * len(sw["order_A_values"])
               * len(sw["order_b_values"]))
 
-    # Number of series
     if compare["axis"] == "matrix_type":
         n_series = len(compare["matrix_type_values"])
     elif compare["axis"] == "structure":
@@ -139,11 +117,19 @@ with st.sidebar:
             f"= **{n_total} runs**."
         )
 
+    # Show active device in sidebar footer
+    use_gpu = prob_params.get("use_gpu", False)
+    if use_gpu:
+        info = gpu_info()
+        dev  = info["devices"][0] if info["devices"] else "GPU"
+        st.caption(f"🟢 Running on GPU: {dev}")
+    else:
+        st.caption("🔵 Running on CPU")
+
     run = st.button(
         "Run Experiment",
         type="primary",
         use_container_width=True,
-        help="Runs every (series × sweep) combination.",
     )
 
 
@@ -165,22 +151,45 @@ def _run_instance(
     structure_i: str, struct_param_i: int,
     m_i: int, order_A_i: int, order_b_i: int,
 ) -> dict:
-    """Build, perturb, solve and analyse one instance. Returns dict or error dict."""
+    use_gpu = p.get("use_gpu", False)
     try:
-        A = create_matrix(
-            matrix_type            = matrix_type_i,
-            m                      = m_i,
-            n                      = m_i,
-            structure              = structure_i,
-            struct_param           = struct_param_i,
-            make_hermitian         = p["make_hermitian"],
-            make_positive_definite = p["make_pd"],
-            dtype                  = p["dtype_A"],
-            seed                   = p["seed"],
-            type_param             = p.get("type_param", 6),
-        )
+        # ── Build A ───────────────────────────────────────────────────────────
+        if p.get("import_A") and p.get("imported_A_array") is not None:
+            # Use imported array — cast dtype and transfer to GPU if needed
+            A_cpu = p["imported_A_array"].astype(p["dtype_A"])
+            if use_gpu:
+                xp = __import__("cupy")
+                A  = xp.asarray(A_cpu)
+            else:
+                A  = A_cpu
+            # Sparsity mask for perturbation (inherited from imported matrix)
+            A_mask = sparsity_mask(A_cpu)
+        else:
+            A      = create_matrix(
+                matrix_type            = matrix_type_i,
+                m                      = m_i,
+                n                      = m_i,
+                structure              = structure_i,
+                struct_param           = struct_param_i,
+                make_hermitian         = p["make_hermitian"],
+                make_positive_definite = p["make_pd"],
+                dtype                  = p["dtype_A"],
+                seed                   = p["seed"],
+                type_param             = p.get("type_param", 6),
+                use_gpu                = use_gpu,
+            )
+            A_mask = None   # use structure-based perturbation
 
-        b = create_rhs(A.shape[0], p["dtype_b"])
+        # ── Build b ───────────────────────────────────────────────────────────
+        if p.get("import_b") and p.get("imported_b_array") is not None:
+            b_cpu = p["imported_b_array"].astype(p["dtype_b"])
+            if use_gpu:
+                xp = __import__("cupy")
+                b  = xp.asarray(b_cpu)
+            else:
+                b  = b_cpu
+        else:
+            b = create_rhs(A.shape[0], p["dtype_b"], use_gpu=use_gpu)
 
         A_original = A.copy()
         b_original = b.copy()
@@ -193,17 +202,22 @@ def _run_instance(
                 struct_param           = struct_param_i,
                 make_hermitian         = p["make_hermitian"],
                 make_positive_definite = p["make_pd"],
+                use_gpu                = use_gpu,
+                custom_mask            = A_mask,
             )
         if p["perturb_b"]:
-            b = apply_perturbation(b, order=order_b_i)
+            b = apply_perturbation(b, order=order_b_i, use_gpu=use_gpu)
 
         delta_A = (A - A_original) if p["perturb_A"] else None
         delta_b = (b - b_original) if p["perturb_b"] else None
 
         solver_fn = SOLVERS[solver_name]
-        result    = solver_fn(A, b)
+        result    = solver_fn(A, b, use_gpu=use_gpu)
         metrics   = stability_analysis(A, b, result["x"],
                                        p.get("norm_type", "2"))
+
+        def _cpu(arr):
+            return to_numpy(arr) if arr is not None else None
 
         return {
             "error":        None,
@@ -214,13 +228,20 @@ def _run_instance(
             "m":            m_i,
             "order_A":      order_A_i,
             "order_b":      order_b_i,
-            "A":            A,
-            "b":            b,
-            "A_original":   A_original,
-            "b_original":   b_original,
-            "delta_A":      delta_A,
-            "delta_b":      delta_b,
-            "result":       result,
+            "use_gpu":      use_gpu,
+            "imported_A":   p.get("import_A", False),
+            "imported_b":   p.get("import_b", False),
+            "A":            _cpu(A),
+            "b":            _cpu(b),
+            "A_original":   _cpu(A_original),
+            "b_original":   _cpu(b_original),
+            "delta_A":      _cpu(delta_A),
+            "delta_b":      _cpu(delta_b),
+            "result":       {
+                **result,
+                "x": _cpu(result["x"]),
+                **({} if "Q" not in result else {"Q": _cpu(result["Q"])}),
+            },
             "metrics":      metrics,
         }
 
@@ -238,27 +259,19 @@ def _run_instance(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helper: build series list from compare + sweep config
+# Helper: build series list
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_series_specs(p: dict, s: dict, cmp: dict) -> list[dict]:
-    """
-    Return a list of series specifications.
-
-    Each spec is a dict with keys:
-        label, matrix_type, structure, struct_param, solver_name
-    """
     base_mt  = p["matrix_type"]
     base_st  = p["structure"]
     base_sp  = p["struct_param"]
     base_sol = s["solver_name"]
-
-    axis = cmp["axis"]
+    axis     = cmp["axis"]
 
     if axis == "matrix_type":
         specs = []
         for mt in cmp["matrix_type_values"]:
-            # Fall back to Dense if the chosen structure is incompatible with this type
             st_name = base_st if base_st in compatible_structures(mt) else "Dense"
             sp      = base_sp if st_name == base_st else 1
             specs.append({
@@ -294,7 +307,6 @@ def _build_series_specs(p: dict, s: dict, cmp: dict) -> list[dict]:
             for sol in cmp["solver_values"]
         ]
 
-    # No compare axis — single series
     return [
         {
             "label":        _single_series_label(p, s),
@@ -307,9 +319,11 @@ def _build_series_specs(p: dict, s: dict, cmp: dict) -> list[dict]:
 
 
 def _single_series_label(p: dict, s: dict) -> str:
-    parts = [p["matrix_type"],
-             structure_label(p["structure"], p["struct_param"]),
-             s["solver_name"]]
+    device = "GPU" if p.get("use_gpu") else "CPU"
+    parts  = [p["matrix_type"],
+              structure_label(p["structure"], p["struct_param"]),
+              s["solver_name"],
+              device]
     return " | ".join(parts)
 
 
@@ -321,9 +335,8 @@ if run:
     p   = prob_params
     s   = solver_params
     sw  = p["sweep"]
-    cmp = compare   # resolved above in sidebar block
+    cmp = compare
 
-    # Pass norm_type into prob_params for use in _run_instance
     p["norm_type"] = s["norm_type"]
 
     series_specs = _build_series_specs(p, s, cmp)
@@ -333,9 +346,9 @@ if run:
         sw["order_b_values"],
     ))
 
-    total_runs = len(series_specs) * len(combos)
-    bar        = st.progress(0, text="Running…")
-    run_idx    = 0
+    total_runs  = len(series_specs) * len(combos)
+    bar         = st.progress(0, text="Running…")
+    run_idx     = 0
     series_list = []
 
     for spec in series_specs:
@@ -346,7 +359,8 @@ if run:
                 run_idx / total_runs,
                 text=(f"[{run_idx}/{total_runs}]  "
                       f"Series: {spec['label']}  |  "
-                      f"m={m_i}, ord_A={oA_i}, ord_b={ob_i}"),
+                      f"m={m_i}, ord_A={oA_i}, ord_b={ob_i}  "
+                      f"{'[GPU]' if p.get('use_gpu') else '[CPU]'}"),
             )
             inst = _run_instance(
                 p,
@@ -374,7 +388,7 @@ if run:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sweep axis helpers  (shared by sections 3 and 4)
+# Sweep / instance helpers  (unchanged from original)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _sweep_axis_label(sweep_param: str | None) -> str:
@@ -408,10 +422,6 @@ def _format_x_ticks(ax, x_vals: list, sweep_param: str | None) -> None:
         ax.set_xticklabels([f"10^{v}" for v in x_vals], fontsize=7)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Instance selector label
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _instance_label(inst: dict, n_total: int, idx: int,
                     sweep_param: str | None) -> str:
     if n_total == 1:
@@ -426,7 +436,7 @@ def _instance_label(inst: dict, n_total: int, idx: int,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Render sections 1 and 2 for one instance
+# Render sections 1 and 2  (all arrays are already CPU numpy here)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _render_instance(inst: dict) -> None:
@@ -434,13 +444,17 @@ def _render_instance(inst: dict) -> None:
         st.error(inst["error"])
         return
 
-    A  = inst["A"]
-    b  = inst["b"]
+    A       = inst["A"]
+    b       = inst["b"]
     result  = inst["result"]
     metrics = inst["metrics"]
 
-    # ── Section 1 ─────────────────────────────────────────────────────────────
+    device_badge = "🟢 GPU" if inst.get("use_gpu") else "🔵 CPU"
+    A_badge      = "📂 imported" if inst.get("imported_A") else "🔧 generated"
+    b_badge      = "📂 imported" if inst.get("imported_b") else "🔧 generated"
+
     st.header("1. Problem creation (A, b)")
+    st.caption(f"Device: {device_badge}  ·  A: {A_badge}  ·  b: {b_badge}")
 
     info = matrix_info(A)
     m, n = info["shape"]
@@ -495,7 +509,6 @@ def _render_instance(inst: dict) -> None:
 
     st.divider()
 
-    # ── Section 2 ─────────────────────────────────────────────────────────────
     st.header(f"2. x̃ via {result['method']}")
 
     if result["success"]:
@@ -525,11 +538,10 @@ def _render_instance(inst: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Section 3 — Problem specific sensitivity metrics
+# Section 3 — κ(A) plot  (identical logic, arrays already CPU)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _render_kappa_plot(series_list: list, sweep_param: str | None) -> None:
-    """Plot κ(A) — one line per series."""
     sns.set_theme(style="whitegrid", font_scale=0.9)
     eps        = np.finfo(float).eps
     kappa_max  = 1.0 / eps
@@ -544,7 +556,6 @@ def _render_kappa_plot(series_list: list, sweep_param: str | None) -> None:
 
     single_inst = sum(len(insts) for _, insts in all_good) == 1
 
-    # ── Single series, single instance — gauge ────────────────────────────────
     if single_inst and len(all_good) == 1:
         kappa = all_good[0][1][0]["metrics"]["kappa"]
         log_k = np.log10(kappa) if kappa > 0 and not np.isinf(kappa) else digits_tot
@@ -581,33 +592,28 @@ def _render_kappa_plot(series_list: list, sweep_param: str | None) -> None:
             st.success(f"κ(A) ≈ {_fmt(kappa)} — well-conditioned.")
         return
 
-    # ── Multi-instance / multi-series line plot ───────────────────────────────
     fig, ax = plt.subplots(figsize=(5.5, 3.8))
-
     ax.axhspan(np.log10(kappa_max) - 2, digits_tot + 1,
                color="#e74c3c", alpha=0.07, zorder=0)
     ax.axhline(np.log10(kappa_max), color="#e74c3c", lw=1.0, ls="--",
                alpha=0.6, label=f"1/ε_mach")
-    ax.axhline(0, color="#27ae60", lw=1.0, ls=":", alpha=0.7,
-               label="κ = 1")
+    ax.axhline(0, color="#27ae60", lw=1.0, ls=":", alpha=0.7, label="κ = 1")
 
     x_label = _sweep_axis_label(sweep_param)
-    all_x = []
+    all_x   = []
 
     for si, (series, insts) in enumerate(all_good):
-        color     = _SERIES_COLORS[si % len(_SERIES_COLORS)]
-        kappas    = [i["metrics"]["kappa"] for i in insts]
+        color      = _SERIES_COLORS[si % len(_SERIES_COLORS)]
+        kappas     = [i["metrics"]["kappa"] for i in insts]
         log_kappas = [
             np.log10(k) if k > 0 and not np.isinf(k) else digits_tot
             for k in kappas
         ]
         x_vals = _sweep_x_values(insts, sweep_param)
         all_x.extend(x_vals)
-
         ax.plot(x_vals, log_kappas, color=color, lw=2.0, marker="o",
                 markersize=5, markerfacecolor="white", markeredgewidth=1.8,
                 zorder=4, label=series["label"])
-
         if len(insts) <= 10:
             for xv, lk in zip(x_vals, log_kappas):
                 ax.annotate(f"{lk:.1f}", xy=(xv, lk), xytext=(0, 6),
@@ -623,7 +629,6 @@ def _render_kappa_plot(series_list: list, sweep_param: str | None) -> None:
     fig.tight_layout()
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
-
     st.caption(f"ε_mach = {eps:.2e},  1/ε_mach ≈ {kappa_max:.2e}.")
 
 
@@ -647,15 +652,10 @@ def _render_section3(series_list: list) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _make_metric_plot(
-    series_list:  list,
-    sweep_param:  str | None,
-    metric_key:   str,
-    title:        str,
-    ylabel:       str,
-    color_single: str,
-    single_label: str,
+    series_list: list, sweep_param: str | None,
+    metric_key: str, title: str, ylabel: str,
+    color_single: str, single_label: str,
 ) -> None:
-    """Generic multi-series metric plot."""
     sns.set_theme(style="whitegrid", font_scale=0.9)
     eps     = np.finfo(float).eps
     log_eps = np.log10(eps)
@@ -668,13 +668,12 @@ def _make_metric_plot(
         return
 
     def _safe_log(v: float) -> float:
-        if v is None or np.isnan(v):   return log_eps
-        if np.isinf(v) or v <= 0:      return 0.0
+        if v is None or np.isnan(v): return log_eps
+        if np.isinf(v) or v <= 0:   return 0.0
         return np.log10(v)
 
     single_inst = sum(len(insts) for _, insts in all_good) == 1
 
-    # ── Single gauge ──────────────────────────────────────────────────────────
     if single_inst and len(all_good) == 1:
         val     = all_good[0][1][0]["metrics"][metric_key]
         log_val = _safe_log(val)
@@ -709,9 +708,7 @@ def _make_metric_plot(
             st.warning(f"{single_label} ≈ {_fmt(val)} — large, check conditioning.")
         return
 
-    # ── Multi-series line plot ────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(5.5, 3.8))
-
     ax.axhline(log_eps, color="#7f8c8d", lw=1.0, ls="--", alpha=0.7,
                label=f"ε_mach")
     ax.axhspan(log_eps - 2, log_eps + 1,
@@ -726,11 +723,9 @@ def _make_metric_plot(
         log_vals = [_safe_log(v) for v in vals]
         x_vals   = _sweep_x_values(insts, sweep_param)
         all_x.extend(x_vals)
-
         ax.plot(x_vals, log_vals, color=color, lw=2.0, marker="o",
                 markersize=5, markerfacecolor="white", markeredgewidth=1.8,
                 zorder=4, label=series["label"])
-
         if len(insts) <= 10:
             for xv, lv in zip(x_vals, log_vals):
                 ax.annotate(f"{lv:.1f}", xy=(xv, lv), xytext=(0, 6),
@@ -746,13 +741,11 @@ def _make_metric_plot(
     fig.tight_layout()
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
-
     st.caption(f"ε_mach = {eps:.2e}.")
 
 
 def _render_section4(series_list: list) -> None:
     st.header("4. Solution quality metrics")
-
     sweep_param = _get_sweep_param(series_list)
     try:
         norm_type = series_list[0]["instances"][0]["solver_params"]["norm_type"]
@@ -761,33 +754,27 @@ def _render_section4(series_list: list) -> None:
     norm_label = "‖·‖₂" if norm_type == "2" else "‖·‖∞"
 
     col1, col2, col3 = st.columns(3)
-
     with col1:
         st.markdown(f"**Residual  ‖r‖  ({norm_label})**")
         _make_metric_plot(series_list, sweep_param,
-                          metric_key   = "residual_norm",
-                          title        = f"Residual  ‖r‖  ({norm_label})",
-                          ylabel       = "log₁₀(‖r‖)",
-                          color_single = "#2980b9",
-                          single_label = "‖r‖")
-
+                          metric_key="residual_norm",
+                          title=f"Residual  ‖r‖  ({norm_label})",
+                          ylabel="log₁₀(‖r‖)",
+                          color_single="#2980b9", single_label="‖r‖")
     with col2:
         st.markdown(f"**Forward error bound  ({norm_label})**")
         _make_metric_plot(series_list, sweep_param,
-                          metric_key   = "forward_bound",
-                          title        = f"Forward error bound  ({norm_label})",
-                          ylabel       = "log₁₀(FEB)",
-                          color_single = "#e67e22",
-                          single_label = "FEB")
-
+                          metric_key="forward_bound",
+                          title=f"Forward error bound  ({norm_label})",
+                          ylabel="log₁₀(FEB)",
+                          color_single="#e67e22", single_label="FEB")
     with col3:
         st.markdown(f"**Backward error  ({norm_label})**")
         _make_metric_plot(series_list, sweep_param,
-                          metric_key   = "backward_error",
-                          title        = f"Backward error  ({norm_label})",
-                          ylabel       = "log₁₀(BE)",
-                          color_single = "#8e44ad",
-                          single_label = "BE")
+                          metric_key="backward_error",
+                          title=f"Backward error  ({norm_label})",
+                          ylabel="log₁₀(BE)",
+                          color_single="#8e44ad", single_label="BE")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -801,11 +788,9 @@ if series_list is None:
         "Configure the problem and solver in the sidebar, "
         "then click **Run Experiment**."
     )
-
 else:
     sweep_param = _get_sweep_param(series_list)
 
-    # ── Series + instance selectors ───────────────────────────────────────────
     n_series = len(series_list)
     if n_series == 1:
         active_series = series_list[0]
@@ -813,9 +798,9 @@ else:
         series_labels = [s["label"] for s in series_list]
         si = st.selectbox(
             f"Series  ({n_series} total — compare axis)",
-            options     = range(n_series),
-            format_func = lambda i: series_labels[i],
-            index       = 0,
+            options=range(n_series),
+            format_func=lambda i: series_labels[i],
+            index=0,
         )
         active_series = series_list[si]
 
@@ -831,16 +816,14 @@ else:
         ]
         ii = st.selectbox(
             f"Instance  ({n_inst} per series — sweep axis)",
-            options     = range(n_inst),
-            format_func = lambda i: inst_labels[i],
-            index       = 0,
+            options=range(n_inst),
+            format_func=lambda i: inst_labels[i],
+            index=0,
         )
         active_inst = instances[ii]
 
-    # ── Sections 1 & 2 — single instance view ─────────────────────────────────
     _render_instance(active_inst)
 
-    # ── Sections 3 & 4 — all series, all instances ────────────────────────────
     _render_section3(series_list)
     st.divider()
 

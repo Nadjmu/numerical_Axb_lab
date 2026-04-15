@@ -1,6 +1,30 @@
+# Core dependencies (CPU mode — always required)
 numpy>=1.24.0
 scipy>=1.10.0
 streamlit>=1.28.0
 pandas>=2.0.0
 matplotlib>=3.7.0
 mpmath>=1.3.0
+seaborn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GPU support (optional — install ONE of these depending on your CUDA version)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Check your CUDA version first:
+#   nvidia-smi          (look for "CUDA Version: XX.X" in the top-right corner)
+#   nvcc --version      (look for "release X.Y")
+#
+# Then install the matching CuPy wheel:
+#
+#   CUDA 11.x:   pip install cupy-cuda11x
+#   CUDA 12.x:   pip install cupy-cuda12x
+#
+# On university HPC clusters CuPy is often available as a module:
+#   module load cupy
+#
+# Verify the installation:
+#   python -c "import cupy; cupy.array([1.0]); print('CuPy OK')"
+#
+# If CuPy is not installed the app starts normally in CPU-only mode.
+# The GPU radio button will be disabled with a clear message.

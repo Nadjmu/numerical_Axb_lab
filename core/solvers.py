@@ -3,30 +3,42 @@ core/solvers.py
 ===============
 Solver implementations for the linear system  Ax = b.
 
-Solvers
--------
-SVD      : Reduced, Full
-QR       : Householder Reduced, Householder Full,
-           Classical Gram-Schmidt, Modified Gram-Schmidt
-Direct   : LU (partial pivoting), Cholesky
-Iterative: GMRES, CG (Conjugate Gradient)
+GPU support
+-----------
+Every public ``solve_*`` function accepts an optional ``use_gpu`` keyword
+argument (default False).  When True, the solver uses CuPy / cuPyx routines
+instead of NumPy / SciPy equivalents.
 
-Each public  solve_*  function has the signature::
+When an input array is already a CuPy array the solver will detect this
+automatically via ``device.is_gpu_array`` and run on the GPU regardless of
+the explicit ``use_gpu`` flag — this avoids accidental CPU round-trips.
 
-    (A: np.ndarray, b: np.ndarray) -> dict
+GPU solver mapping
+------------------
+| CPU solver                | GPU solver                           |
+|---------------------------|--------------------------------------|
+| numpy.linalg.svd          | cupy.linalg.svd                      |
+| numpy.linalg.qr           | cupy.linalg.qr                       |
+| scipy.linalg.lu_factor/   | cupyx.scipy.linalg.lu_factor/        |
+|   lu_solve                |   lu_solve                           |
+| scipy.linalg.cho_factor/  | cupyx.scipy.linalg.cho_factor/       |
+|   cho_solve               |   cho_solve                          |
+| scipy.linalg.             | cupyx.scipy.linalg.                  |
+|   solve_triangular        |   solve_triangular                   |
+| scipy.sparse.csc_matrix + | cupyx.scipy.sparse.csc_matrix +      |
+|   sparse.linalg.splu      |   sparse.linalg.splu                 |
+| scipy.sparse.linalg.gmres | cupyx.scipy.sparse.linalg.gmres      |
+| scipy.sparse.linalg.cg    | cupyx.scipy.sparse.linalg.cg         |
 
-The returned dict always contains:
-
-    x          : np.ndarray  – computed solution
-    method     : str         – human-readable method name
-    success    : bool        – whether the solver completed
-    message    : str         – status / diagnostic text
-
-QR-based solvers additionally return:
-
-    Q          : np.ndarray  – the Q factor (used for orthogonality analysis)
-
-The public registry ``SOLVERS`` maps display names to solver functions.
+Notes
+-----
+- ``numpy.linalg.cond`` is not available in CuPy; condition number is
+  computed via ``cupy.linalg.svd`` directly (σ_max / σ_min).
+- The classical and modified Gram-Schmidt implementations are hand-written
+  loops; they run on whatever array type (numpy/cupy) is passed in.
+- All returned ``x`` values are arrays on the same device as the input.
+  The caller (app.py / analysis.py) is responsible for calling
+  ``device.to_numpy`` before plotting or display.
 """
 
 from __future__ import annotations
@@ -36,19 +48,37 @@ import scipy.linalg as la
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
+from core.device import (
+    get_array_module, get_linalg, get_sparse, get_sparse_linalg,
+    is_gpu_array, to_numpy,
+)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Precondition helpers
+# Helpers to pick CPU vs GPU sub-modules
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _check_compatible(A: np.ndarray, b: np.ndarray) -> None:
+def _use_gpu_from_array(A, use_gpu: bool) -> bool:
+    """Return True if we should run on GPU, considering both flag and array type."""
+    return use_gpu or is_gpu_array(A)
+
+
+def _xp(use_gpu: bool):
+    return get_array_module(use_gpu)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Precondition helpers  (device-agnostic)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _check_compatible(A, b) -> None:
     if A.shape[0] != b.shape[0]:
         raise ValueError(
             f"Shape mismatch: A has {A.shape[0]} rows but b has length {b.shape[0]}."
         )
 
 
-def _check_square(A: np.ndarray, name: str) -> None:
+def _check_square(A, name: str) -> None:
     if A.shape[0] != A.shape[1]:
         raise ValueError(
             f"'{name}' requires a square matrix "
@@ -56,20 +86,22 @@ def _check_square(A: np.ndarray, name: str) -> None:
         )
 
 
-def _check_symmetric(A: np.ndarray, name: str, tol: float = 1e-8) -> None:
+def _check_symmetric(A, name: str, tol: float = 1e-8) -> None:
     _check_square(A, name)
-    if not np.allclose(A, A.T, atol=tol, rtol=tol):
+    xp = get_array_module(_use_gpu_from_array(A, False))
+    # Use numpy for the allclose test (CuPy has np.allclose equivalent)
+    A_cpu = to_numpy(A)
+    if not np.allclose(A_cpu, A_cpu.T, atol=tol, rtol=tol):
         raise ValueError(
             f"'{name}' requires a symmetric matrix. "
             "Enable the 'Hermitian' option in the problem creation panel."
         )
 
 
-def _check_positive_definite(A: np.ndarray, name: str) -> None:
-    """Check SPD by attempting a Cholesky factorisation."""
+def _check_positive_definite(A, name: str) -> None:
     _check_symmetric(A, name)
     try:
-        np.linalg.cholesky(A)
+        np.linalg.cholesky(to_numpy(A))
     except np.linalg.LinAlgError:
         raise ValueError(
             f"'{name}' requires a positive definite matrix. "
@@ -78,79 +110,76 @@ def _check_positive_definite(A: np.ndarray, name: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utility: least-squares triangular solve
+# Utility: triangular solve
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _triangular_lstsq(R: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """
-    Solve  R x = rhs  where R is upper triangular (or upper trapezoidal).
-
-    For square R this calls the numerically preferred ``solve_triangular``.
-    For non-square R (underdetermined) it falls back to ``lstsq``.
-    """
+def _triangular_lstsq(R, rhs, use_gpu: bool = False):
+    """Solve R x = rhs where R is upper triangular (or trapezoidal)."""
     if R.shape[0] == R.shape[1]:
-        return la.solve_triangular(R, rhs)
-    x, *_ = np.linalg.lstsq(R, rhs, rcond=None)
-    return x
+        sla_mod = get_linalg(use_gpu)
+        return sla_mod.solve_triangular(R, rhs)
+    # Fallback lstsq — must happen on CPU for both backends
+    R_cpu, rhs_cpu = to_numpy(R), to_numpy(rhs)
+    x_cpu, *_ = np.linalg.lstsq(R_cpu, rhs_cpu, rcond=None)
+    if use_gpu:
+        xp = get_array_module(True)
+        return xp.asarray(x_cpu)
+    return x_cpu
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SVD solvers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _svd_solve(A: np.ndarray, b: np.ndarray, full_matrices: bool) -> dict:
-    """
-    Solve  Ax ≈ b  via the pseudoinverse  x = V Σ⁺ Uᵀ b.
-
-    Singular values below  ε · max(m, n) · σ_max  are treated as zero,
-    giving the minimum-norm least-squares solution.
-    """
+def _svd_solve(A, b, full_matrices: bool, use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
+    gpu  = _use_gpu_from_array(A, use_gpu)
+    xp   = get_array_module(gpu)
     label = "Full" if full_matrices else "Reduced"
 
     A_f = A.astype(float)
     b_f = b.astype(float)
 
-    U, s, Vt = np.linalg.svd(A_f, full_matrices=full_matrices)
+    U, s, Vt = xp.linalg.svd(A_f, full_matrices=full_matrices)
 
-    # Threshold for numerical rank determination
-    tol   = np.finfo(float).eps * max(A_f.shape) * s[0]
-    s_inv = np.where(s > tol, 1.0 / s, 0.0)
-    rank  = int(np.sum(s > tol))
-    k     = len(s)
+    eps   = float(np.finfo(float).eps)
+    s_cpu = to_numpy(s)
+    tol   = eps * max(A_f.shape) * float(s_cpu[0])
+    s_inv_cpu = np.where(s_cpu > tol, 1.0 / s_cpu, 0.0)
+    rank  = int(np.sum(s_cpu > tol))
+    k     = len(s_cpu)
 
-    # x = V diag(s_inv) Uᵀ b
-    Utb = U[:, :k].T @ b_f      # shape (k,)
-    x   = Vt[:k].T @ (s_inv * Utb)  # shape (n,)
+    s_inv = xp.asarray(s_inv_cpu)
+    Utb   = U[:, :k].T @ b_f
+    x     = Vt[:k].T @ (s_inv * Utb)
 
     return {
         "x":       x,
         "method":  f"SVD ({label})",
         "success": True,
         "message": (
-            f"Pseudoinverse via {label} SVD.  "
+            f"Pseudoinverse via {label} SVD {'[GPU]' if gpu else '[CPU]'}.  "
             f"Numerical rank = {rank} / {k}  (threshold = {tol:.2e})."
         ),
     }
 
 
-def solve_svd_reduced(A, b): return _svd_solve(A, b, full_matrices=False)
-def solve_svd_full(A, b):    return _svd_solve(A, b, full_matrices=True)
+def solve_svd_reduced(A, b, use_gpu: bool = False):
+    return _svd_solve(A, b, False, use_gpu)
+
+def solve_svd_full(A, b, use_gpu: bool = False):
+    return _svd_solve(A, b, True, use_gpu)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Householder QR  (via LAPACK  dgeqrf / dorgqr)
+# Householder QR
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _householder_qr_solve(A: np.ndarray, b: np.ndarray, full_matrices: bool) -> dict:
-    """
-    Solve  Ax ≈ b  via Householder QR then back-substitution.
-
-    For  m >= n: overdetermined / square — computes the least-squares solution
-                 by solving the triangular system  R x = Qᵀ b.
-    For  m <  n: underdetermined — falls back to lstsq on the trapezoidal R.
-    """
+def _householder_qr_solve(A, b, full_matrices: bool,
+                           use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
+    gpu   = _use_gpu_from_array(A, use_gpu)
+    xp    = get_array_module(gpu)
     m, n  = A.shape
     label = "Full" if full_matrices else "Reduced"
     mode  = "complete" if full_matrices else "reduced"
@@ -158,12 +187,10 @@ def _householder_qr_solve(A: np.ndarray, b: np.ndarray, full_matrices: bool) -> 
     A_f = A.astype(float)
     b_f = b.astype(float)
 
-    Q, R = np.linalg.qr(A_f, mode=mode)
+    Q, R = xp.linalg.qr(A_f, mode=mode)
     k    = min(m, n)
-
-    # Project rhs onto the column space of A
-    Qtb = Q[:, :k].T @ b_f   # shape (k,)
-    x   = _triangular_lstsq(R[:k, :], Qtb)
+    Qtb  = Q[:, :k].T @ b_f
+    x    = _triangular_lstsq(R[:k, :], Qtb, gpu)
 
     return {
         "x":       x,
@@ -172,55 +199,52 @@ def _householder_qr_solve(A: np.ndarray, b: np.ndarray, full_matrices: bool) -> 
         "method":  f"QR Householder ({label})",
         "success": True,
         "message": (
-            f"LAPACK Householder QR ({label}).  "
+            f"{'CuPy' if gpu else 'LAPACK'} Householder QR ({label}) "
+            f"{'[GPU]' if gpu else '[CPU]'}.  "
             f"System: {'overdetermined/square' if m >= n else 'underdetermined'}."
         ),
     }
 
 
-def solve_qr_householder_reduced(A, b): return _householder_qr_solve(A, b, False)
-def solve_qr_householder_full(A, b):    return _householder_qr_solve(A, b, True)
+def solve_qr_householder_reduced(A, b, use_gpu: bool = False):
+    return _householder_qr_solve(A, b, False, use_gpu)
+
+def solve_qr_householder_full(A, b, use_gpu: bool = False):
+    return _householder_qr_solve(A, b, True, use_gpu)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Classical Gram-Schmidt  (CGS)
+# Classical Gram-Schmidt  (device-agnostic loop)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _classical_gram_schmidt(A: np.ndarray):
-    """
-    Compute the thin QR decomposition  A = Q R  via Classical Gram-Schmidt.
-
-    Returns Q (m × k) and R (k × k), where  k = min(m, n).
-
-    Numerical behaviour: CGS can lose orthogonality rapidly when A is
-    ill-conditioned because projections are computed against the *original*
-    column  a_j  before any correction.
-    """
-    m, n  = A.shape
-    k     = min(m, n)
-    Q     = np.zeros((m, k), dtype=float)
-    R     = np.zeros((k, k), dtype=float)
+def _classical_gram_schmidt(A):
+    """Works for both numpy and cupy arrays."""
+    xp   = get_array_module(is_gpu_array(A))
+    m, n = A.shape
+    k    = min(m, n)
+    Q    = xp.zeros((m, k), dtype=float)
+    R    = xp.zeros((k, k), dtype=float)
 
     for j in range(k):
-        a_j = A[:, j].astype(float)   # original column — used for all projections
+        a_j = A[:, j].astype(float)
         v   = a_j.copy()
         for i in range(j):
-            R[i, j] = Q[:, i] @ a_j  # projection uses original a_j
+            R[i, j] = Q[:, i] @ a_j
             v       -= R[i, j] * Q[:, i]
-        R[j, j] = np.linalg.norm(v)
-        if R[j, j] > 1e-14:
+        R[j, j] = xp.linalg.norm(v)
+        if float(R[j, j]) > 1e-14:
             Q[:, j] = v / R[j, j]
-        # If R[j,j] ≈ 0 the column is nearly linearly dependent; Q[:,j] stays 0.
-
     return Q, R
 
 
-def solve_cgs(A: np.ndarray, b: np.ndarray) -> dict:
-    """Classical Gram-Schmidt QR solver."""
+def solve_cgs(A, b, use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
-    Q, R = _classical_gram_schmidt(A)
+    gpu  = _use_gpu_from_array(A, use_gpu)
+    xp   = get_array_module(gpu)
+    A_f  = xp.asarray(A.astype(float))
+    Q, R = _classical_gram_schmidt(A_f)
     Qtb  = Q.T @ b.astype(float)
-    x    = _triangular_lstsq(R, Qtb)
+    x    = _triangular_lstsq(R, Qtb, gpu)
     return {
         "x":       x,
         "Q":       Q,
@@ -228,49 +252,43 @@ def solve_cgs(A: np.ndarray, b: np.ndarray) -> dict:
         "method":  "QR (Classical Gram-Schmidt)",
         "success": True,
         "message": (
-            "Classical GS: computes projections from the original column, "
-            "which can cause catastrophic loss of orthogonality for "
-            "ill-conditioned matrices."
+            f"Classical GS {'[GPU]' if gpu else '[CPU]'}: projections from the "
+            "original column — can lose orthogonality for ill-conditioned matrices."
         ),
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Modified Gram-Schmidt  (MGS)
+# Modified Gram-Schmidt  (device-agnostic loop)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _modified_gram_schmidt(A: np.ndarray):
-    """
-    Compute the thin QR decomposition  A = Q R  via Modified Gram-Schmidt.
-
-    Returns Q (m × k) and R (k × k), where  k = min(m, n).
-
-    Numerical behaviour: MGS re-orthogonalises against each q_i using the
-    *current* (partially corrected) vector, which significantly improves
-    orthogonality retention compared with CGS — at the same O(mn²) cost.
-    """
-    m, n  = A.shape
-    k     = min(m, n)
-    Q     = A[:, :k].astype(float).copy()   # working copy; overwritten in place
-    R     = np.zeros((k, k), dtype=float)
+def _modified_gram_schmidt(A):
+    """Works for both numpy and cupy arrays."""
+    xp   = get_array_module(is_gpu_array(A))
+    m, n = A.shape
+    k    = min(m, n)
+    Q    = xp.asarray(A[:, :k].astype(float).copy() if not is_gpu_array(A)
+                      else A[:, :k].astype(float).copy())
+    R    = xp.zeros((k, k), dtype=float)
 
     for i in range(k):
-        R[i, i] = np.linalg.norm(Q[:, i])
-        if R[i, i] > 1e-14:
+        R[i, i] = xp.linalg.norm(Q[:, i])
+        if float(R[i, i]) > 1e-14:
             Q[:, i] /= R[i, i]
         for j in range(i + 1, k):
-            R[i, j]  = Q[:, i] @ Q[:, j]   # projection uses the *current* Q[:,j]
+            R[i, j]  = Q[:, i] @ Q[:, j]
             Q[:, j] -= R[i, j] * Q[:, i]
-
     return Q, R
 
 
-def solve_mgs(A: np.ndarray, b: np.ndarray) -> dict:
-    """Modified Gram-Schmidt QR solver."""
+def solve_mgs(A, b, use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
-    Q, R = _modified_gram_schmidt(A)
+    gpu  = _use_gpu_from_array(A, use_gpu)
+    xp   = get_array_module(gpu)
+    A_f  = xp.asarray(A.astype(float))
+    Q, R = _modified_gram_schmidt(A_f)
     Qtb  = Q.T @ b.astype(float)
-    x    = _triangular_lstsq(R, Qtb)
+    x    = _triangular_lstsq(R, Qtb, gpu)
     return {
         "x":       x,
         "Q":       Q,
@@ -278,8 +296,8 @@ def solve_mgs(A: np.ndarray, b: np.ndarray) -> dict:
         "method":  "QR (Modified Gram-Schmidt)",
         "success": True,
         "message": (
-            "Modified GS: orthogonalises against the current vector at each step. "
-            "Substantially better orthogonality retention than Classical GS."
+            f"Modified GS {'[GPU]' if gpu else '[CPU]'}: orthogonalises against "
+            "current vector — substantially better than Classical GS."
         ),
     }
 
@@ -288,67 +306,70 @@ def solve_mgs(A: np.ndarray, b: np.ndarray) -> dict:
 # LU with partial pivoting
 # ──────────────────────────────────────────────────────────────────────────────
 
-def solve_lu(A: np.ndarray, b: np.ndarray) -> dict:
-    """
-    Solve  Ax = b  via LU factorisation with partial pivoting  (PA = LU).
-
-    Requires a square matrix.  Uses LAPACK's  dgetrf / dgetrs  via SciPy.
-    """
+def solve_lu(A, b, use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
     _check_square(A, "LU")
-    lu, piv = la.lu_factor(A.astype(float))
-    x       = la.lu_solve((lu, piv), b.astype(float))
+    gpu    = _use_gpu_from_array(A, use_gpu)
+    sla    = get_linalg(gpu)
+    A_f    = A.astype(float)
+    b_f    = b.astype(float)
+    lu, piv = sla.lu_factor(A_f)
+    x       = sla.lu_solve((lu, piv), b_f)
     return {
         "x":       x,
         "method":  "LU (partial pivoting)",
         "success": True,
-        "message": "LAPACK PA = LU with partial pivoting.  Requires a square matrix.",
+        "message": (
+            f"PA = LU with partial pivoting {'[GPU]' if gpu else '[CPU/LAPACK]'}.  "
+            "Requires a square matrix."
+        ),
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sparse LU  (SuperLU via scipy.sparse)
+# Sparse LU  (SuperLU / cuSolver)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def solve_lu_sparse(A: np.ndarray, b: np.ndarray) -> dict:
-    """
-    Solve  Ax = b  via sparse LU factorisation (SuperLU).
-
-    The dense matrix A is converted to CSC (Compressed Sparse Column) format
-    internally.  SuperLU applies column reordering (COLAMD) to minimise
-    fill-in in the L and U factors, then performs the factorisation.
-
-    For matrices with a sparse structure (tridiagonal, banded, block-tridiagonal)
-    this exploits the sparsity and is substantially faster than dense LU for
-    large m.  For dense matrices the conversion overhead makes it slightly
-    slower than regular LU.
-
-    Requires a square matrix.
-    """
+def solve_lu_sparse(A, b, use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
     _check_square(A, "LU (Sparse)")
+    gpu  = _use_gpu_from_array(A, use_gpu)
 
-    A_f   = A.astype(float)
-    b_f   = b.astype(float)
+    A_f   = to_numpy(A).astype(float)
+    b_f_cpu = to_numpy(b).astype(float)
     nnz   = int(np.count_nonzero(A_f))
     total = A_f.shape[0] ** 2
 
-    # Convert dense → CSC sparse format (only non-zeros stored)
-    A_csc = sp.csc_matrix(A_f)
-
-    # SuperLU factorisation with COLAMD column reordering
-    lu    = spla.splu(A_csc)
-    x     = lu.solve(b_f)
+    if gpu:
+        # CuPy sparse path
+        try:
+            import cupyx.scipy.sparse as cpsp
+            import cupyx.scipy.sparse.linalg as cpspla
+            import cupy as cp
+            A_csc = cpsp.csc_matrix(cp.asarray(A_f))
+            b_gpu = cp.asarray(b_f_cpu)
+            lu    = cpspla.splu(A_csc)
+            x     = lu.solve(b_gpu)
+            backend = "cuSolver/SuperLU [GPU]"
+        except Exception as e:
+            # Fallback: dense cupy solve if sparse path fails
+            import cupy as cp
+            x = cp.linalg.solve(cp.asarray(A_f), cp.asarray(b_f_cpu))
+            backend = f"cupy.linalg.solve [GPU] (sparse fallback, reason: {e})"
+    else:
+        A_csc = sp.csc_matrix(A_f)
+        lu    = spla.splu(A_csc)
+        x     = lu.solve(b_f_cpu)
+        backend = "SuperLU/COLAMD [CPU]"
 
     density = nnz / total if total > 0 else 1.0
     return {
-        "x":       x,
+        "x":       x if gpu else x,
         "method":  "LU (Sparse / SuperLU)",
         "success": True,
         "message": (
-            f"SuperLU with COLAMD reordering.  "
-            f"Matrix density = {density:.1%}  ({nnz:,} non-zeros of {total:,}).  "
-            f"Sparse format exploits zeros for faster factorisation."
+            f"{backend}.  "
+            f"Matrix density = {density:.1%}  ({nnz:,} non-zeros of {total:,})."
         ),
     }
 
@@ -357,22 +378,23 @@ def solve_lu_sparse(A: np.ndarray, b: np.ndarray) -> dict:
 # Cholesky
 # ──────────────────────────────────────────────────────────────────────────────
 
-def solve_cholesky(A: np.ndarray, b: np.ndarray) -> dict:
-    """
-    Solve  Ax = b  via Cholesky factorisation  (A = L Lᵀ).
-
-    Requires A to be square, symmetric, and positive definite.
-    Uses LAPACK's  dpotrf / dpotrs  via SciPy.
-    """
+def solve_cholesky(A, b, use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
     _check_positive_definite(A, "Cholesky")
-    c, low = la.cho_factor(A.astype(float))
-    x      = la.cho_solve((c, low), b.astype(float))
+    gpu    = _use_gpu_from_array(A, use_gpu)
+    sla    = get_linalg(gpu)
+    A_f    = A.astype(float)
+    b_f    = b.astype(float)
+    c, low = sla.cho_factor(A_f)
+    x      = sla.cho_solve((c, low), b_f)
     return {
         "x":       x,
         "method":  "Cholesky",
         "success": True,
-        "message": "LAPACK Cholesky A = LLᵀ.  Requires a symmetric positive definite matrix.",
+        "message": (
+            f"Cholesky A = LLᵀ {'[GPU]' if gpu else '[CPU/LAPACK]'}.  "
+            "Requires symmetric positive definite matrix."
+        ),
     }
 
 
@@ -380,53 +402,47 @@ def solve_cholesky(A: np.ndarray, b: np.ndarray) -> dict:
 # GMRES
 # ──────────────────────────────────────────────────────────────────────────────
 
-def solve_gmres(A: np.ndarray, b: np.ndarray) -> dict:
-    """
-    Solve  Ax = b  via the Generalised Minimum Residual method.
-
-    GMRES minimises the residual over Krylov subspaces and works for any
-    non-singular square matrix.  No symmetry is required.
-    """
+def solve_gmres(A, b, use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
     _check_square(A, "GMRES")
+    gpu    = _use_gpu_from_array(A, use_gpu)
+    spla_m = get_sparse_linalg(gpu)
+    xp     = get_array_module(gpu)
+
     A_f = A.astype(float)
     b_f = b.astype(float)
-    x, info = spla.gmres(A_f, b_f, rtol=1e-10, atol=1e-14)
+
+    # cupyx gmres signature matches scipy
+    x, info = spla_m.gmres(A_f, b_f, rtol=1e-10, atol=1e-14)
     success  = info == 0
-    msg      = "Converged." if success else f"Did not converge (SciPy info code = {info})."
-    return {
-        "x":       x,
-        "method":  "GMRES",
-        "success": success,
-        "message": msg,
-    }
+    msg = (
+        f"{'CuPy' if gpu else 'SciPy'} GMRES {'[GPU]' if gpu else '[CPU]'} — "
+        + ("Converged." if success else f"Did not converge (info={info}).")
+    )
+    return {"x": x, "method": "GMRES", "success": success, "message": msg}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Conjugate Gradient  (CG)
+# Conjugate Gradient
 # ──────────────────────────────────────────────────────────────────────────────
 
-def solve_cg(A: np.ndarray, b: np.ndarray) -> dict:
-    """
-    Solve  Ax = b  via the Conjugate Gradient method.
-
-    CG is optimal for symmetric positive definite matrices: it minimises
-    the A-norm of the error over Krylov subspaces.  Convergence rate
-    depends on  sqrt(κ(A)).
-    """
+def solve_cg(A, b, use_gpu: bool = False) -> dict:
     _check_compatible(A, b)
     _check_positive_definite(A, "CG")
+    gpu    = _use_gpu_from_array(A, use_gpu)
+    spla_m = get_sparse_linalg(gpu)
+
     A_f = A.astype(float)
     b_f = b.astype(float)
-    x, info = spla.cg(A_f, b_f, rtol=1e-10, atol=1e-14)
+
+    x, info = spla_m.cg(A_f, b_f, rtol=1e-10, atol=1e-14)
     success  = info == 0
-    msg      = "Converged." if success else f"Did not converge (SciPy info code = {info})."
-    return {
-        "x":       x,
-        "method":  "CG (Conjugate Gradient)",
-        "success": success,
-        "message": msg,
-    }
+    msg = (
+        f"{'CuPy' if gpu else 'SciPy'} CG {'[GPU]' if gpu else '[CPU]'} — "
+        + ("Converged." if success else f"Did not converge (info={info}).")
+    )
+    return {"x": x, "method": "CG (Conjugate Gradient)",
+            "success": success, "message": msg}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
