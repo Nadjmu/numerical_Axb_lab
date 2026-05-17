@@ -211,7 +211,7 @@ Both are independent — you can import A but generate b randomly, import b but 
 | Hermitian / PD checkboxes | Shown | Hidden |
 | Perturbation | Uses selected structure mask | Inherits sparsity pattern of imported array |
 | GPU transfer | After generation | After import, before solve |
-| dtype cast | Via dtype selector | Via dtype selector (cast applied after load) |
+| dtype cast | Via dtype selector | Preserved for float/complex dtypes; integer/bool inputs cast to float64 |
 
 ### Perturbation on imported matrices
 
@@ -225,7 +225,7 @@ Implemented via `sparsity_mask(A)` in `core/problem_creation.py`, which returns 
 - A must be 2-D and square
 - b must be 1-D with length matching A's row count
 - All values must be finite (no NaN or Inf)
-- Any numeric dtype is accepted and cast to the selected dtype after loading
+- Float and complex dtypes (e.g. `float64`, `complex128`) are accepted and preserved as-is; integer/bool arrays are cast to `float64`
 
 ---
 
@@ -530,7 +530,8 @@ Matrix A                            b: 🔧 generated / 📂 imported
   [ ] Import A from .npy            [A: shape dtype nnz density memory]
       └─ file uploader              [b: dtype memory               ]
   ── or, if not importing ──        A entries / heatmap  |  b entries / heatmap
-  Type                              ΔA / ΔA heatmap      |  Δb (if perturbed)
+  Type                              Zoom: crop A[n_low:n_high] (expander)
+                                    ΔA / ΔA heatmap      |  Δb (if perturbed)
   Seed
   Type param (if applicable)     2. x̃ via <solver>  [CPU] or [GPU]
   Size m  [Sweep checkbox]          x entries / heatmap
@@ -559,3 +560,6 @@ Norm  (2 / inf)
 
 [Run Experiment]
 ```
+
+### Heatmaps
+Diverging colourmap (blue=negative, red=positive, white=zero). Cell annotations for matrices ≤ 20×20. Spy plot fallback for matrices > 150×150. Complex matrices show Re and Im as side-by-side panels.

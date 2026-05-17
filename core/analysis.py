@@ -57,8 +57,8 @@ def _residual_mpmath(A_cpu, b_cpu, x_cpu):
     b_mp = _mpmath.matrix(b_cpu.tolist())
     x_mp = _mpmath.matrix(x_cpu.tolist())
     r_mp = b_mp - A_mp * x_mp
-    norm_r = float(_mpmath.sqrt(sum(r_mp[i]**2 for i in range(len(b_cpu)))))
-    r = np.array([float(r_mp[i]) for i in range(len(b_cpu))], dtype=np.float64)
+    norm_r = float(_mpmath.sqrt(sum(abs(r_mp[i])**2 for i in range(len(b_cpu)))))
+    r = np.array([complex(r_mp[i]) for i in range(len(b_cpu))])
     return r, norm_r, f"mpmath ({MP_DPS} dps)"
 
 
@@ -71,7 +71,7 @@ def _residual_float128(A_cpu, b_cpu, x_cpu):
 
 
 def _residual_float64(A_cpu, b_cpu, x_cpu):
-    r      = b_cpu.astype(np.float64) - A_cpu.astype(np.float64) @ x_cpu.astype(np.float64)
+    r      = b_cpu - A_cpu @ x_cpu
     norm_r = float(np.linalg.norm(r))
     return r, norm_r, "float64 (standard)"
 
@@ -81,13 +81,13 @@ def compute_residual(A, b, x):
     Compute r = b − A x and ‖r‖₂ in the highest precision available.
 
     GPU arrays are automatically pulled to CPU for the high-precision path.
-    The returned residual vector is always a CPU NumPy float64 array
-    (callers that need a GPU array can do xp.asarray(r) themselves).
+    The dtype of the inputs is preserved — complex arrays are not cast to real.
     """
-    A_cpu = to_numpy(A).astype(np.float64)
-    b_cpu = to_numpy(b).astype(np.float64)
-    x_cpu = to_numpy(x).astype(np.float64)
+    A_cpu = to_numpy(A)
+    b_cpu = to_numpy(b)
+    x_cpu = to_numpy(x)
     m     = A_cpu.shape[0]
+    is_complex = np.issubdtype(A_cpu.dtype, np.complexfloating)
 
     if _MPMATH_AVAILABLE and m <= MP_SIZE_THRESHOLD:
         try:
@@ -95,7 +95,7 @@ def compute_residual(A, b, x):
         except Exception:
             pass
 
-    if _FLOAT128_WIDER:
+    if _FLOAT128_WIDER and not is_complex:
         try:
             return _residual_float128(A_cpu, b_cpu, x_cpu)
         except Exception:
@@ -124,16 +124,17 @@ def _mat_norm(A, norm_type: str) -> float:
 
     CuPy supports np.inf norm directly.  For the 2-norm CuPy does not
     support ord=2 for matrices, so we compute σ_max via SVD.
+    Complex arrays are not cast to real.
     """
     if norm_type == "2":
         if is_gpu_array(A):
             import cupy as cp
-            s = cp.linalg.svd(A.astype(float), compute_uv=False)
+            s = cp.linalg.svd(A, compute_uv=False)
             return float(s[0])
-        return float(np.linalg.norm(A.astype(float), ord=2))
+        return float(np.linalg.norm(A, ord=2))
     else:
         xp = get_array_module(is_gpu_array(A))
-        return float(xp.linalg.norm(A.astype(float), ord=np.inf))
+        return float(xp.linalg.norm(A, ord=np.inf))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,24 +147,23 @@ def condition_number(A, norm_type: str) -> float:
 
     For CuPy arrays, uses singular values directly (cupy.linalg.svd)
     since cupy.linalg.cond is not available.
+    Complex arrays are not cast to real — their dtype is preserved.
     """
     try:
         if is_gpu_array(A):
             import cupy as cp
-            A_f = A.astype(float)
             if norm_type == "2":
-                s = cp.linalg.svd(A_f, compute_uv=False)
+                s = cp.linalg.svd(A, compute_uv=False)
                 s_cpu = to_numpy(s)
                 if s_cpu[-1] == 0:
                     return float("inf")
                 return float(s_cpu[0] / s_cpu[-1])
             else:
-                # ‖A‖∞ · ‖A⁻¹‖∞  — compute via numpy on CPU copy
-                A_cpu = to_numpy(A_f)
+                A_cpu = to_numpy(A)
                 return float(np.linalg.cond(A_cpu, p=np.inf))
         else:
             order = _norm_order(norm_type)
-            return float(np.linalg.cond(A.astype(float), p=order))
+            return float(np.linalg.cond(A, p=order))
     except (np.linalg.LinAlgError, ValueError):
         return float("inf")
 

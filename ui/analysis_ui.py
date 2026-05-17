@@ -96,73 +96,73 @@ def render_heatmap(label: str, arr: np.ndarray) -> None:
     """
     Render a seaborn heatmap for a 2-D numpy array.
 
-    Design choices
-    --------------
-    - Diverging palette centred at zero so sign is immediately visible.
-    - Cell annotations shown for small matrices (≤ _ANNOT_MAX × _ANNOT_MAX).
-    - Colorbar with symmetric limits so zero is always mid-colour.
-    - Thin grid lines separating cells for readability.
-    - For large matrices (> _HEATMAP_MAX) falls back to a spy dot plot.
+    For complex arrays, Re and Im are shown as two side-by-side panels.
+    For large matrices (> _HEATMAP_MAX) falls back to a spy dot plot.
     """
     _apply_heatmap_style()
-    m, n = arr.shape
+    is_cx  = np.iscomplexobj(arr)
+    parts  = [("Re", arr.real), ("Im", arr.imag)] if is_cx else [("", arr)]
+    m, n   = arr.shape
 
     if m > _HEATMAP_MAX or n > _HEATMAP_MAX:
-        # Spy plot fallback — avoid rendering a massive image
-        fig, ax = plt.subplots(figsize=(4, 4))
-        ax.spy(arr, markersize=max(1, 180 // max(m, n)), color="#2166ac")
-        ax.set_title(label, fontsize=10, fontweight="bold", pad=8)
-        ax.set_xlabel("column", fontsize=8)
-        ax.set_ylabel("row",    fontsize=8)
-        ax.xaxis.set_label_position("bottom")
-        ax.xaxis.tick_bottom()
+        ncols = 2 if is_cx else 1
+        fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4))
+        if ncols == 1:
+            axes = [axes]
+        for ax, (part_label, data) in zip(axes, parts):
+            ax.spy(data, markersize=max(1, 180 // max(m, n)), color="#2166ac")
+            ax.set_title(f"{label}  [{part_label}]" if is_cx else label,
+                         fontsize=10, fontweight="bold", pad=8)
+            ax.set_xlabel("column", fontsize=8)
+            ax.set_ylabel("row",    fontsize=8)
+            ax.xaxis.set_label_position("bottom")
+            ax.xaxis.tick_bottom()
         st.caption(
-            f"Matrix is {m} × {n} — showing non-zero pattern.  "
-            "Blue dot = non-zero entry, white = zero."
+            f"Matrix is {m} × {n} — showing non-zero pattern"
+            + ("  (Re | Im)." if is_cx else ".  Blue dot = non-zero, white = zero.")
         )
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
         return
 
-    # ── Heatmap ──────────────────────────────────────────────────────────────
-    annot  = (m <= _ANNOT_MAX and n <= _ANNOT_MAX)
-    fmt    = _annotate_fmt(arr) if annot else ""
-    absmax = float(np.nanmax(np.abs(arr))) or 1.0
-
-    # Figure size: scale with matrix dimension, capped for readability
+    annot     = (m <= _ANNOT_MAX and n <= _ANNOT_MAX)
     cell_size = max(0.4, min(0.9, 8.0 / max(m, n)))
-    fig_w = min(n * cell_size + 1.5, 10.0)
-    fig_h = min(m * cell_size + 1.2,  8.0)
+    ncols = 2 if is_cx else 1
+    fig_w = min(n * cell_size * ncols + 1.5 * ncols, 14.0)
+    fig_h = min(m * cell_size + 1.2, 8.0)
 
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig, axes = plt.subplots(1, ncols, figsize=(fig_w, fig_h))
+    if ncols == 1:
+        axes = [axes]
 
-    sns.heatmap(
-        arr,
-        ax          = ax,
-        cmap        = _diverging_cmap(),
-        center      = 0,
-        vmin        = -absmax,
-        vmax        =  absmax,
-        annot       = annot,
-        fmt         = fmt,
-        annot_kws   = {"size": max(6, min(10, int(80 / max(m, n))))},
-        linewidths  = 0.4 if m <= 40 else 0.0,
-        linecolor   = "#cccccc",
-        square      = True,
-        cbar_kws    = {"shrink": 0.75, "label": "value"},
-        xticklabels = True if n <= 30 else False,
-        yticklabels = True if m <= 30 else False,
-    )
-
-    ax.set_title(label, fontsize=10, fontweight="bold", pad=8)
-    ax.set_xlabel("column", fontsize=8)
-    ax.set_ylabel("row",    fontsize=8)
-    ax.tick_params(axis="both", labelsize=7)
-
-    # Rotate x-tick labels if there are many columns
-    if n > 10:
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+    for ax, (part_label, data) in zip(axes, parts):
+        absmax = float(np.nanmax(np.abs(data))) or 1.0
+        fmt    = _annotate_fmt(data) if annot else ""
+        sns.heatmap(
+            data,
+            ax          = ax,
+            cmap        = _diverging_cmap(),
+            center      = 0,
+            vmin        = -absmax,
+            vmax        =  absmax,
+            annot       = annot,
+            fmt         = fmt,
+            annot_kws   = {"size": max(6, min(10, int(80 / max(m, n))))},
+            linewidths  = 0.4 if m <= 40 else 0.0,
+            linecolor   = "#cccccc",
+            square      = True,
+            cbar_kws    = {"shrink": 0.75, "label": "value"},
+            xticklabels = n <= 30,
+            yticklabels = m <= 30,
+        )
+        ax.set_title(f"{label}  [{part_label}]" if is_cx else label,
+                     fontsize=10, fontweight="bold", pad=8)
+        ax.set_xlabel("column", fontsize=8)
+        ax.set_ylabel("row",    fontsize=8)
+        ax.tick_params(axis="both", labelsize=7)
+        if n > 10:
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
 
     fig.tight_layout()
     st.pyplot(fig, use_container_width=True)
@@ -272,8 +272,13 @@ def render_array(label: str, arr: np.ndarray) -> None:
     elif arr.ndim == 2:
         m, n = arr.shape
         data = arr[:_DISPLAY_MAX, :_DISPLAY_MAX]
-        df   = pd.DataFrame(data)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        if np.iscomplexobj(data):
+            st.caption("Re(A)  —  real part:")
+            st.dataframe(pd.DataFrame(data.real), use_container_width=True, hide_index=True)
+            st.caption("Im(A)  —  imaginary part:")
+            st.dataframe(pd.DataFrame(data.imag), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
         if m > _DISPLAY_MAX or n > _DISPLAY_MAX:
             st.caption(
                 f"Showing [{min(m, _DISPLAY_MAX)} × {min(n, _DISPLAY_MAX)}] "

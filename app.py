@@ -155,8 +155,8 @@ def _run_instance(
     try:
         # ── Build A ───────────────────────────────────────────────────────────
         if p.get("import_A") and p.get("imported_A_array") is not None:
-            # Use imported array — cast dtype and transfer to GPU if needed
-            A_cpu = p["imported_A_array"].astype(p["dtype_A"])
+            # Use imported array — preserve original dtype, transfer to GPU if needed
+            A_cpu = p["imported_A_array"]
             if use_gpu:
                 xp = __import__("cupy")
                 A  = xp.asarray(A_cpu)
@@ -182,7 +182,7 @@ def _run_instance(
 
         # ── Build b ───────────────────────────────────────────────────────────
         if p.get("import_b") and p.get("imported_b_array") is not None:
-            b_cpu = p["imported_b_array"].astype(p["dtype_b"])
+            b_cpu = p["imported_b_array"]
             if use_gpu:
                 xp = __import__("cupy")
                 b  = xp.asarray(b_cpu)
@@ -487,6 +487,33 @@ def _render_instance(inst: dict) -> None:
                 render_array("b", b)
             with tab_heat_b:
                 render_vector_heatmap("b", b)
+
+        with st.expander("Zoom: crop submatrix  A[n_low : n_high, n_low : n_high]", expanded=False):
+            crop_bound = min(A.shape[0], A.shape[1])
+            crop_c1, crop_c2 = st.columns(2)
+            with crop_c1:
+                crop_low = int(st.number_input(
+                    "n_low  (inclusive)", min_value=0,
+                    max_value=crop_bound - 1, value=0, step=1, key="crop_low"))
+            with crop_c2:
+                crop_high = int(st.number_input(
+                    "n_high  (exclusive)", min_value=1,
+                    max_value=crop_bound, value=min(crop_bound, 10), step=1,
+                    key="crop_high"))
+            if crop_low >= crop_high:
+                st.warning("n_low must be strictly less than n_high.")
+            else:
+                crop_sub = A[crop_low:crop_high, crop_low:crop_high]
+                crop_sz  = crop_high - crop_low
+                st.caption(
+                    f"A[{crop_low}:{crop_high}, {crop_low}:{crop_high}]  —  "
+                    f"{crop_sz} × {crop_sz}"
+                )
+                crop_tab_e, crop_tab_h = st.tabs(["Entries", "Heatmap"])
+                with crop_tab_e:
+                    render_array(f"A[{crop_low}:{crop_high}]", crop_sub)
+                with crop_tab_h:
+                    render_heatmap(f"A[{crop_low}:{crop_high}]", crop_sub)
 
         if inst["delta_A"] is not None or inst["delta_b"] is not None:
             st.markdown("**Perturbation**")
