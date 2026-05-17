@@ -394,8 +394,8 @@ if run:
 def _sweep_axis_label(sweep_param: str | None) -> str:
     return {
         "m":               "Matrix size  m",
-        "perturb_A_order": "Perturbation order  k  (‖ΔA‖ ≈ 10^k · ‖A‖)",
-        "perturb_b_order": "Perturbation order  k  (‖Δb‖ ≈ 10^k · ‖b‖)",
+        "perturb_A_order": "Perturbation order  k  (||dA|| ~ 10^k * ||A||)",
+        "perturb_b_order": "Perturbation order  k  (||db|| ~ 10^k * ||b||)",
     }.get(sweep_param or "", "Instance")
 
 
@@ -453,88 +453,89 @@ def _render_instance(inst: dict) -> None:
     A_badge      = "📂 imported" if inst.get("imported_A") else "🔧 generated"
     b_badge      = "📂 imported" if inst.get("imported_b") else "🔧 generated"
 
-    st.header("1. Problem creation (A, b)")
-    st.caption(f"Device: {device_badge}  ·  A: {A_badge}  ·  b: {b_badge}")
-
     info = matrix_info(A)
     m, n = info["shape"]
 
-    col_A_hdr, col_b_hdr = st.columns([5, 1])
-    with col_A_hdr:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Shape",     f"{m} × {n}")
-        c2.metric("dtype",     info["dtype"])
-        c3.metric("Non-zeros", f"{info['nnz']:,}")
-        c4.metric("Density",   f"{info['density']:.2%}")
-        c5.metric("Memory",    _bytes_to_human(info["memory_bytes"]))
-    with col_b_hdr:
-        st.metric("dtype",  str(b.dtype))
-        st.metric("Memory", _bytes_to_human(b.nbytes))
+    col1, col2 = st.columns(2)
 
-    col_A, col_b = st.columns([5, 1])
-    with col_A:
-        tab_tbl, tab_heat = st.tabs(["Entries", "Heatmap"])
-        with tab_tbl:
-            render_array("A", A)
-        with tab_heat:
-            render_heatmap("A", A)
-    with col_b:
-        tab_tbl_b, tab_heat_b = st.tabs(["Entries", "Heatmap"])
-        with tab_tbl_b:
-            render_array("b", b)
-        with tab_heat_b:
-            render_vector_heatmap("b", b)
+    with col1:
+        st.subheader("1. Problem creation (A, b)")
+        st.caption(f"Device: {device_badge}  ·  A: {A_badge}  ·  b: {b_badge}")
 
-    if inst["delta_A"] is not None or inst["delta_b"] is not None:
-        st.markdown("**Perturbation**")
-        col_dA, col_db = st.columns([5, 1])
-        with col_dA:
-            if inst["delta_A"] is not None:
-                tab_tbl_dA, tab_heat_dA = st.tabs(["ΔA entries", "ΔA heatmap"])
-                with tab_tbl_dA:
-                    render_array("ΔA", inst["delta_A"])
-                with tab_heat_dA:
-                    render_heatmap("ΔA", inst["delta_A"])
-            else:
-                st.caption("No perturbation applied to A.")
-        with col_db:
-            if inst["delta_b"] is not None:
-                tab_tbl_db, tab_heat_db = st.tabs(["Δb entries", "Δb heatmap"])
-                with tab_tbl_db:
-                    render_array("Δb", inst["delta_b"])
-                with tab_heat_db:
-                    render_vector_heatmap("Δb", inst["delta_b"])
-            else:
-                st.caption("No perturbation applied to b.")
+        col_A_hdr, col_b_hdr = st.columns([5, 1])
+        with col_A_hdr:
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Shape",     f"{m} × {n}")
+            c2.metric("dtype",     info["dtype"])
+            c3.metric("Non-zeros", f"{info['nnz']:,}")
+            c4.metric("Density",   f"{info['density']:.2%}")
+            c5.metric("Memory",    _bytes_to_human(info["memory_bytes"]))
+        with col_b_hdr:
+            st.metric("dtype",  str(b.dtype))
+            st.metric("Memory", _bytes_to_human(b.nbytes))
+
+        col_A, col_b = st.columns([5, 1])
+        with col_A:
+            tab_tbl, tab_heat = st.tabs(["Entries", "Heatmap"])
+            with tab_tbl:
+                render_array("A", A)
+            with tab_heat:
+                render_heatmap("A", A)
+        with col_b:
+            tab_tbl_b, tab_heat_b = st.tabs(["Entries", "Heatmap"])
+            with tab_tbl_b:
+                render_array("b", b)
+            with tab_heat_b:
+                render_vector_heatmap("b", b)
+
+        if inst["delta_A"] is not None or inst["delta_b"] is not None:
+            st.markdown("**Perturbation**")
+            col_dA, col_db = st.columns([5, 1])
+            with col_dA:
+                if inst["delta_A"] is not None:
+                    tab_tbl_dA, tab_heat_dA = st.tabs(["ΔA entries", "ΔA heatmap"])
+                    with tab_tbl_dA:
+                        render_array("ΔA", inst["delta_A"])
+                    with tab_heat_dA:
+                        render_heatmap("ΔA", inst["delta_A"])
+                else:
+                    st.caption("No perturbation applied to A.")
+            with col_db:
+                if inst["delta_b"] is not None:
+                    tab_tbl_db, tab_heat_db = st.tabs(["Δb entries", "Δb heatmap"])
+                    with tab_tbl_db:
+                        render_array("Δb", inst["delta_b"])
+                    with tab_heat_db:
+                        render_vector_heatmap("Δb", inst["delta_b"])
+                else:
+                    st.caption("No perturbation applied to b.")
+
+    with col2:
+        st.subheader(f"2. x̃ via {result['method']}")
+
+        if result["success"]:
+            st.success(result["message"])
+        else:
+            st.warning(result["message"])
+
+        x = result["x"]
+        col_x, col_stab = st.columns([1, 5])
+        with col_x:
+            st.metric("dtype",  str(x.dtype))
+            st.metric("Memory", _bytes_to_human(x.nbytes))
+            tab_tbl_x, tab_heat_x = st.tabs(["Entries", "Heatmap"])
+            with tab_tbl_x:
+                render_array("x̃", x)
+            with tab_heat_x:
+                render_vector_heatmap("x̃", x)
+        with col_stab:
+            with st.expander("Stability analysis (detailed)", expanded=False):
+                render_stability(metrics)
+            if "Q" in result:
+                with st.expander("Q-factor orthogonality (QR solvers)", expanded=False):
+                    render_orthogonality(result)
 
     st.divider()
-
-    st.header(f"2. x̃ via {result['method']}")
-
-    if result["success"]:
-        st.success(result["message"])
-    else:
-        st.warning(result["message"])
-
-    x = result["x"]
-    col_x, col_empty = st.columns([1, 5])
-    with col_x:
-        st.metric("dtype",  str(x.dtype))
-        st.metric("Memory", _bytes_to_human(x.nbytes))
-        tab_tbl_x, tab_heat_x = st.tabs(["Entries", "Heatmap"])
-        with tab_tbl_x:
-            render_array("x̃", x)
-        with tab_heat_x:
-            render_vector_heatmap("x̃", x)
-
-    if "Q" in result:
-        with st.expander("Q-factor orthogonality (QR solvers)", expanded=False):
-            render_orthogonality(result)
-
-    st.divider()
-
-    with st.expander("Stability analysis (detailed)", expanded=False):
-        render_stability(metrics)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -567,15 +568,15 @@ def _render_kappa_plot(series_list: list, sweep_param: str | None) -> None:
                   cmap="RdYlGn_r", alpha=0.25, zorder=0)
         ax.axvline(digits_lost, color="#c0392b", lw=2.5, zorder=3)
         ax.text(digits_lost + 0.15, 0.25,
-                f"log₁₀(κ) = {log_k:.1f}\n({digits_lost:.1f} digits lost)",
+                f"log10(kappa) = {log_k:.1f}\n({digits_lost:.1f} digits lost)",
                 fontsize=8, color="#c0392b", va="center")
         ax.axvline(0, color="#27ae60", lw=1.2, ls="--", zorder=2)
-        ax.text(0.15, -0.28, "ε_mach", fontsize=7, color="#27ae60")
+        ax.text(0.15, -0.28, "eps_mach", fontsize=7, color="#27ae60")
         ax.set_xlim(-0.5, digits_tot + 1)
         ax.set_ylim(-0.5, 0.5)
-        ax.set_xlabel("Significant digits lost  = log₁₀(κ(A))", fontsize=8)
+        ax.set_xlabel("Significant digits lost = log10(kappa(A))", fontsize=8)
         ax.set_yticks([])
-        ax.set_title(f"κ(A) = {_fmt(kappa)}", fontsize=9, fontweight="bold")
+        ax.set_title(f"kappa(A) = {_fmt(kappa)}", fontsize=9, fontweight="bold")
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
@@ -596,8 +597,8 @@ def _render_kappa_plot(series_list: list, sweep_param: str | None) -> None:
     ax.axhspan(np.log10(kappa_max) - 2, digits_tot + 1,
                color="#e74c3c", alpha=0.07, zorder=0)
     ax.axhline(np.log10(kappa_max), color="#e74c3c", lw=1.0, ls="--",
-               alpha=0.6, label=f"1/ε_mach")
-    ax.axhline(0, color="#27ae60", lw=1.0, ls=":", alpha=0.7, label="κ = 1")
+               alpha=0.6, label="1/eps_mach")
+    ax.axhline(0, color="#27ae60", lw=1.0, ls=":", alpha=0.7, label="kappa = 1")
 
     x_label = _sweep_axis_label(sweep_param)
     all_x   = []
@@ -621,8 +622,8 @@ def _render_kappa_plot(series_list: list, sweep_param: str | None) -> None:
                             fontsize=7, ha="center", color=color)
 
     ax.set_xlabel(x_label, fontsize=9)
-    ax.set_ylabel("log₁₀(κ(A))", fontsize=9)
-    ax.set_title("Condition number κ(A)", fontsize=10, fontweight="bold")
+    ax.set_ylabel("log10(kappa(A))", fontsize=9)
+    ax.set_title("Condition number kappa(A)", fontsize=10, fontweight="bold")
     ax.legend(fontsize=7, loc="best")
     ax.tick_params(labelsize=8)
     _format_x_ticks(ax, sorted(set(all_x)), sweep_param)
@@ -633,18 +634,14 @@ def _render_kappa_plot(series_list: list, sweep_param: str | None) -> None:
 
 
 def _render_section3(series_list: list) -> None:
-    st.header("3. Problem specific sensitivity metrics")
+    st.subheader("3. Problem specific sensitivity metrics")
     sweep_param = _get_sweep_param(series_list)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("**κ(A)**")
-        _render_kappa_plot(series_list, sweep_param)
-    with col2:
-        st.markdown("**—**")
-        st.caption("Coming soon.")
-    with col3:
-        st.markdown("**—**")
-        st.caption("Coming soon.")
+    st.markdown("**κ(A)**")
+    _render_kappa_plot(series_list, sweep_param)
+    st.markdown("**—**")
+    st.caption("Coming soon.")
+    st.markdown("**—**")
+    st.caption("Coming soon.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -686,12 +683,12 @@ def _make_metric_plot(
         ax.axvline(log_val,  color=color_single, lw=2.5, zorder=3)
         ax.axvline(log_eps,  color="#7f8c8d",    lw=1.2, ls="--", zorder=2)
         ax.axvline(0.0,      color="#27ae60",    lw=1.0, ls=":",  zorder=2)
-        ax.text(log_val + 0.1, 0.28, f"log₁₀ = {log_val:.1f}",
+        ax.text(log_val + 0.1, 0.28, f"log10 = {log_val:.1f}",
                 fontsize=8, color=color_single, va="center")
-        ax.text(log_eps + 0.1, -0.30, "ε_mach", fontsize=7, color="#7f8c8d")
+        ax.text(log_eps + 0.1, -0.30, "eps_mach", fontsize=7, color="#7f8c8d")
         ax.set_xlim(lo, hi)
         ax.set_ylim(-0.5, 0.5)
-        ax.set_xlabel(f"log₁₀({single_label})", fontsize=8)
+        ax.set_xlabel(f"log10({single_label})", fontsize=8)
         ax.set_yticks([])
         ax.set_title(f"{title}  =  {_fmt(val)}", fontsize=9, fontweight="bold")
         fig.tight_layout()
@@ -710,9 +707,9 @@ def _make_metric_plot(
 
     fig, ax = plt.subplots(figsize=(5.5, 3.8))
     ax.axhline(log_eps, color="#7f8c8d", lw=1.0, ls="--", alpha=0.7,
-               label=f"ε_mach")
+               label="eps_mach")
     ax.axhspan(log_eps - 2, log_eps + 1,
-               color="#27ae60", alpha=0.07, label="Near ε_mach")
+               color="#27ae60", alpha=0.07, label="Near eps_mach")
 
     x_label = _sweep_axis_label(sweep_param)
     all_x   = []
@@ -745,36 +742,33 @@ def _make_metric_plot(
 
 
 def _render_section4(series_list: list) -> None:
-    st.header("4. Solution quality metrics")
+    st.subheader("4. Solution quality metrics")
     sweep_param = _get_sweep_param(series_list)
     try:
         norm_type = series_list[0]["instances"][0]["solver_params"]["norm_type"]
     except (IndexError, KeyError):
         norm_type = "2"
-    norm_label = "‖·‖₂" if norm_type == "2" else "‖·‖∞"
+    norm_label      = "||.||_2" if norm_type == "2" else "||.||_inf"
+    norm_label_html = "‖·‖₂"   if norm_type == "2" else "‖·‖∞"
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown(f"**Residual  ‖r‖  ({norm_label})**")
-        _make_metric_plot(series_list, sweep_param,
-                          metric_key="residual_norm",
-                          title=f"Residual  ‖r‖  ({norm_label})",
-                          ylabel="log₁₀(‖r‖)",
-                          color_single="#2980b9", single_label="‖r‖")
-    with col2:
-        st.markdown(f"**Forward error bound  ({norm_label})**")
-        _make_metric_plot(series_list, sweep_param,
-                          metric_key="forward_bound",
-                          title=f"Forward error bound  ({norm_label})",
-                          ylabel="log₁₀(FEB)",
-                          color_single="#e67e22", single_label="FEB")
-    with col3:
-        st.markdown(f"**Backward error  ({norm_label})**")
-        _make_metric_plot(series_list, sweep_param,
-                          metric_key="backward_error",
-                          title=f"Backward error  ({norm_label})",
-                          ylabel="log₁₀(BE)",
-                          color_single="#8e44ad", single_label="BE")
+    st.markdown(f"**Residual  ‖r‖  ({norm_label_html})**")
+    _make_metric_plot(series_list, sweep_param,
+                      metric_key="residual_norm",
+                      title=f"Residual ||r|| ({norm_label})",
+                      ylabel="log10(||r||)",
+                      color_single="#2980b9", single_label="||r||")
+    st.markdown(f"**Forward error bound  ({norm_label_html})**")
+    _make_metric_plot(series_list, sweep_param,
+                      metric_key="forward_bound",
+                      title=f"Forward error bound ({norm_label})",
+                      ylabel="log10(FEB)",
+                      color_single="#e67e22", single_label="FEB")
+    st.markdown(f"**Backward error  ({norm_label_html})**")
+    _make_metric_plot(series_list, sweep_param,
+                      metric_key="backward_error",
+                      title=f"Backward error ({norm_label})",
+                      ylabel="log10(BE)",
+                      color_single="#8e44ad", single_label="BE")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -824,23 +818,25 @@ else:
 
     _render_instance(active_inst)
 
-    _render_section3(series_list)
+    col3, col4 = st.columns(2)
+    with col3:
+        _render_section3(series_list)
+    with col4:
+        _render_section4(series_list)
     st.divider()
 
-    _render_section4(series_list)
+    col5, col6 = st.columns(2)
+    with col5:
+        st.subheader("5. Solver behaviour metrics")
+        st.caption("Coming soon.")
+    with col6:
+        st.subheader("6. Structural metrics")
+        st.caption("Coming soon.")
     st.divider()
 
-    st.header("5. Solver behaviour metrics")
+    st.subheader("7. Summary")
     st.caption("Coming soon.")
     st.divider()
 
-    st.header("6. Structural metrics")
-    st.caption("Coming soon.")
-    st.divider()
-
-    st.header("7. Summary")
-    st.caption("Coming soon.")
-    st.divider()
-
-    st.header("8. Save results")
+    st.subheader("8. Save results")
     st.caption("Coming soon.")
