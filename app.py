@@ -140,6 +140,9 @@ with st.sidebar:
 if "series_list" not in st.session_state:
     st.session_state.series_list = None
 
+if "crop_count_lab1" not in st.session_state:
+    st.session_state.crop_count_lab1 = 1
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helper: run one instance
@@ -385,6 +388,7 @@ if run:
     bar.empty()
     st.session_state.series_list = series_list
     st.session_state.compare     = cmp
+    st.session_state.pop("_lab1_pdf_bytes", None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -488,32 +492,41 @@ def _render_instance(inst: dict) -> None:
             with tab_heat_b:
                 render_vector_heatmap("b", b)
 
-        with st.expander("Zoom: crop submatrix  A[n_low : n_high, n_low : n_high]", expanded=False):
-            crop_bound = min(A.shape[0], A.shape[1])
-            crop_c1, crop_c2 = st.columns(2)
-            with crop_c1:
-                crop_low = int(st.number_input(
-                    "n_low  (inclusive)", min_value=0,
-                    max_value=crop_bound - 1, value=0, step=1, key="crop_low"))
-            with crop_c2:
-                crop_high = int(st.number_input(
-                    "n_high  (exclusive)", min_value=1,
-                    max_value=crop_bound, value=min(crop_bound, 10), step=1,
-                    key="crop_high"))
-            if crop_low >= crop_high:
-                st.warning("n_low must be strictly less than n_high.")
-            else:
-                crop_sub = A[crop_low:crop_high, crop_low:crop_high]
-                crop_sz  = crop_high - crop_low
-                st.caption(
-                    f"A[{crop_low}:{crop_high}, {crop_low}:{crop_high}]  —  "
-                    f"{crop_sz} × {crop_sz}"
-                )
-                crop_tab_e, crop_tab_h = st.tabs(["Entries", "Heatmap"])
-                with crop_tab_e:
-                    render_array(f"A[{crop_low}:{crop_high}]", crop_sub)
-                with crop_tab_h:
-                    render_heatmap(f"A[{crop_low}:{crop_high}]", crop_sub)
+        crop_bound = min(A.shape[0], A.shape[1])
+        _n_crops = st.session_state.crop_count_lab1
+        for _ci in range(_n_crops):
+            with st.expander(
+                f"Zoom: crop #{_ci + 1}  A[n_low : n_high, n_low : n_high]",
+                expanded=(_ci == 0),
+            ):
+                crop_c1, crop_c2 = st.columns(2)
+                with crop_c1:
+                    crop_low = int(st.number_input(
+                        "n_low  (inclusive)", min_value=0,
+                        max_value=crop_bound - 1, value=0, step=1,
+                        key=f"crop_low_{_ci}"))
+                with crop_c2:
+                    crop_high = int(st.number_input(
+                        "n_high  (exclusive)", min_value=1,
+                        max_value=crop_bound, value=min(crop_bound, 10), step=1,
+                        key=f"crop_high_{_ci}"))
+                if crop_low >= crop_high:
+                    st.warning("n_low must be strictly less than n_high.")
+                else:
+                    crop_sub = A[crop_low:crop_high, crop_low:crop_high]
+                    crop_sz  = crop_high - crop_low
+                    st.caption(
+                        f"A[{crop_low}:{crop_high}, {crop_low}:{crop_high}]  —  "
+                        f"{crop_sz} × {crop_sz}"
+                    )
+                    crop_tab_e, crop_tab_h = st.tabs(["Entries", "Heatmap"])
+                    with crop_tab_e:
+                        render_array(f"A[{crop_low}:{crop_high}]", crop_sub)
+                    with crop_tab_h:
+                        render_heatmap(f"A[{crop_low}:{crop_high}]", crop_sub)
+        if st.button("+ Add another crop", key="add_crop_lab1"):
+            st.session_state.crop_count_lab1 += 1
+            st.rerun()
 
         if inst["delta_A"] is not None or inst["delta_b"] is not None:
             st.markdown("**Perturbation**")
@@ -799,6 +812,247 @@ def _render_section4(series_list: list) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Sections 7 & 8 — summary and PDF export
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_summary_text(active_inst: dict, series_list: list) -> str:
+    p       = active_inst.get("prob_params", {})
+    s       = active_inst.get("solver_params", {})
+    res     = active_inst["result"]
+    metrics = active_inst["metrics"]
+    A       = active_inst["A"]
+    b       = active_inst["b"]
+    x       = res["x"]
+
+    device_str = "GPU" if active_inst.get("use_gpu") else "CPU"
+    src_A  = "imported (.npy)" if active_inst.get("imported_A") else active_inst.get("matrix_type", "N/A")
+    src_b  = "imported (.npy)" if active_inst.get("imported_b") else "generated (random)"
+
+    lines = [
+        "=== Numerical Ax = b Lab — Experiment Summary ===",
+        "",
+        "-- PROBLEM --",
+        f"  Source (A)    : {src_A}",
+        f"  Source (b)    : {src_b}",
+        f"  Structure     : {active_inst.get('structure', 'N/A')} (param={active_inst.get('struct_param', 'N/A')})",
+        f"  Size          : {active_inst['m']} x {active_inst['m']}",
+        f"  dtype A       : {A.dtype}",
+        f"  dtype b       : {b.dtype}",
+        f"  Seed          : {p.get('seed', 'N/A')}",
+        f"  Hermitian     : {p.get('make_hermitian', False)}",
+        f"  Positive def. : {p.get('make_pd', False)}",
+        f"  Perturbed A   : {p.get('perturb_A', False)}"
+        + (f" (order 10^{active_inst.get('order_A')})" if p.get("perturb_A") else ""),
+        f"  Perturbed b   : {p.get('perturb_b', False)}"
+        + (f" (order 10^{active_inst.get('order_b')})" if p.get("perturb_b") else ""),
+        f"  Device        : {device_str}",
+        "",
+        "-- SOLVER --",
+        f"  Method        : {res.get('method', 'N/A')}",
+        f"  Norm type     : {p.get('norm_type', '2')} ({'||.||_2 Euclidean' if p.get('norm_type','2') == '2' else '||.||_inf max'}) ",
+        f"  Success       : {res.get('success', 'N/A')}",
+        f"  Message       : {res.get('message', '')}",
+        "",
+        "-- NUMERICAL ANALYSIS --",
+        f"  kappa(A)           : {metrics['kappa']:.6e}",
+        f"  ||A||              : {metrics['norm_A']:.6e}",
+        f"  ||x~||             : {metrics['norm_x']:.6e}",
+        f"  ||b||              : {metrics['norm_b']:.6e}",
+        f"  ||r|| (residual)   : {metrics['residual_norm']:.6e}",
+        f"  Forward err. bound : {metrics['forward_bound']:.6e}",
+        f"  Backward error     : {metrics['backward_error']:.6e}",
+        f"  Residual precision : {metrics['residual_prec']}",
+    ]
+
+    if "Q" in res and res.get("Q") is not None:
+        Q    = res["Q"]
+        orth = float(np.linalg.norm(Q.T @ Q - np.eye(Q.shape[1]), ord="fro"))
+        lines.append(f"  Q orth. error      : {orth:.6e}")
+
+    lines += ["", "-- SOLUTION x~ (first 10 entries) --"]
+    for i in range(min(10, len(x))):
+        xi = x[i]
+        if np.iscomplexobj(x):
+            lines.append(f"  x~[{i:3d}]: Re={xi.real:+.6e}  Im={xi.imag:+.6e}")
+        else:
+            lines.append(f"  x~[{i:3d}]: {float(xi):+.6e}")
+    if len(x) > 10:
+        lines.append(f"  ... ({len(x) - 10} more entries)")
+
+    lines += [
+        "",
+        "-- EXPERIMENT SCALE --",
+        f"  Series            : {len(series_list)}",
+        f"  Instances/series  : {len(series_list[0]['instances']) if series_list else 0}",
+        "",
+        "=== END SUMMARY ===",
+    ]
+    return "\n".join(lines)
+
+
+def _build_pdf_bytes(active_inst: dict, series_list: list) -> bytes:
+    import io
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    summary = _build_summary_text(active_inst, series_list)
+    A       = active_inst["A"]
+    metrics = active_inst["metrics"]
+    sweep_p = _get_sweep_param(series_list)
+    eps     = np.finfo(float).eps
+
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+
+        # Page 1 — summary text
+        fig = plt.figure(figsize=(8.5, 11))
+        ax  = fig.add_axes([0.05, 0.03, 0.90, 0.94])
+        ax.axis("off")
+        ax.text(0, 1, summary, fontsize=6.5, family="monospace",
+                va="top", ha="left", transform=ax.transAxes)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        # Page 2 — A heatmap (Re + Im side-by-side for complex matrices)
+        is_cx  = np.iscomplexobj(A)
+        parts  = [("Re(A)", A.real), ("Im(A)", A.imag)] if is_cx else [("A", A)]
+        ncols  = len(parts)
+        pal    = sns.diverging_palette(220, 10, as_cmap=True)
+        fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 6))
+        if ncols == 1:
+            axes = [axes]
+        for ax, (part_lbl, data) in zip(axes, parts):
+            if min(A.shape) > 150:
+                ax.spy(data, markersize=1, color="#2980b9")
+                ax.set_title(f"{part_lbl} — sparsity pattern", fontsize=10, fontweight="bold")
+            else:
+                absmax_d  = float(np.nanmax(np.abs(data))) or 1.0
+                linthresh = max(absmax_d * 1e-3, np.finfo(float).tiny * 10)
+                import matplotlib.colors as mcolors
+                norm = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
+                                          vmin=-absmax_d, vmax=absmax_d, base=10)
+                sns.heatmap(data, ax=ax, cmap=pal, norm=norm,
+                            annot=min(A.shape) <= 20, fmt=".2g",
+                            linewidths=0.3 if min(A.shape) <= 20 else 0,
+                            cbar_kws={"label": "value (log scale)"})
+                ax.set_title(part_lbl, fontsize=10, fontweight="bold")
+        fig.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        # Page 3 — kappa(A) gauge
+        kappa      = metrics["kappa"]
+        digits_tot = -np.log10(eps)
+        log_k      = (np.log10(kappa) if kappa > 0 and not np.isinf(kappa) else digits_tot)
+        dl         = min(log_k, digits_tot)
+        fig, ax = plt.subplots(figsize=(8, 2.6))
+        grad = np.linspace(0, 1, 256).reshape(1, -1)
+        ax.imshow(grad, aspect="auto", extent=[0, digits_tot, -0.4, 0.4],
+                  cmap="RdYlGn_r", alpha=0.30, zorder=0)
+        ax.axvline(dl, color="#c0392b", lw=2.5, zorder=3)
+        ax.text(dl + 0.2, 0.22, f"log10(kappa) = {log_k:.2f}\n({dl:.1f} digits lost)",
+                fontsize=9, color="#c0392b")
+        ax.axvline(0, color="#27ae60", lw=1.2, ls="--", zorder=2)
+        ax.set_xlabel("Significant digits lost  =  log10(kappa(A))", fontsize=9)
+        ax.set_yticks([])
+        ax.set_xlim(-0.5, digits_tot + 1)
+        ax.set_title(f"Condition number  kappa(A) = {_fmt(kappa)}", fontsize=10, fontweight="bold")
+        fig.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        # Page 4 — residual / FEB / backward error gauges
+        lo_g = np.log10(eps) - 1
+        hi_g = 2.0
+        fig, axes = plt.subplots(1, 3, figsize=(13, 3))
+        for ax_i, (key, lbl, color) in enumerate([
+            ("residual_norm",  "||r||  (residual)",      "#2980b9"),
+            ("forward_bound",  "Forward error bound",    "#e67e22"),
+            ("backward_error", "Backward error",         "#8e44ad"),
+        ]):
+            val = metrics[key]
+            lv  = (np.log10(val) if val is not None and val > 0 and not np.isinf(val)
+                   else np.log10(eps))
+            grad = np.linspace(0, 1, 256).reshape(1, -1)
+            axes[ax_i].imshow(grad, aspect="auto", extent=[lo_g, hi_g, -0.4, 0.4],
+                              cmap="RdYlGn", alpha=0.25)
+            axes[ax_i].axvline(lv, color=color, lw=2.5)
+            axes[ax_i].axvline(np.log10(eps), color="#7f8c8d", lw=1.2, ls="--")
+            axes[ax_i].set_xlabel("log10", fontsize=8)
+            axes[ax_i].set_yticks([])
+            axes[ax_i].set_title(f"{lbl}\n= {_fmt(val)}", fontsize=9, fontweight="bold")
+            axes[ax_i].set_xlim(lo_g, hi_g)
+        fig.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        # Page 5 — sweep plots (only if multi-instance)
+        all_good = [(s, [i for i in s["instances"] if not i.get("error")])
+                    for s in series_list]
+        all_good = [(s, insts) for s, insts in all_good if insts]
+        if sum(len(insts) for _, insts in all_good) > 1:
+            fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+            for ax_i, (key, lbl, ylabel) in enumerate([
+                ("kappa",          "kappa(A)",      "log10(kappa(A))"),
+                ("residual_norm",  "||r||",         "log10(||r||)"),
+                ("backward_error", "Backward error","log10(BE)"),
+            ]):
+                for si, (ser, insts) in enumerate(all_good):
+                    color = _SERIES_COLORS[si % len(_SERIES_COLORS)]
+                    raw   = [i["metrics"][key] for i in insts]
+                    logged = [np.log10(v) if v is not None and v > 0 and not np.isinf(v)
+                              else np.log10(eps) for v in raw]
+                    x_vals = _sweep_x_values(insts, sweep_p)
+                    axes[ax_i].plot(x_vals, logged, color=color, lw=1.8,
+                                    marker="o", markersize=4, label=ser["label"])
+                axes[ax_i].axhline(np.log10(eps), color="#7f8c8d", lw=1, ls="--", alpha=0.6)
+                axes[ax_i].set_xlabel(_sweep_axis_label(sweep_p), fontsize=8)
+                axes[ax_i].set_ylabel(ylabel, fontsize=8)
+                axes[ax_i].set_title(lbl, fontsize=9, fontweight="bold")
+                axes[ax_i].tick_params(labelsize=7)
+                if len(series_list) > 1:
+                    axes[ax_i].legend(fontsize=6)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+    buf.seek(0)
+    return buf.read()
+
+
+def _render_section7(active_inst: dict, series_list: list) -> None:
+    st.subheader("7. Summary")
+    if active_inst.get("error"):
+        st.error(active_inst["error"])
+        return
+    summary_text = _build_summary_text(active_inst, series_list)
+    st.text_area(
+        "Copy and paste into an LLM to verify results:",
+        value=summary_text,
+        height=440,
+    )
+
+
+def _render_section8(active_inst: dict, series_list: list) -> None:
+    st.subheader("8. Save results")
+    if active_inst.get("error"):
+        st.error(active_inst["error"])
+        return
+    if st.button("Generate PDF", key="gen_pdf_lab1"):
+        with st.spinner("Building PDF…"):
+            pdf_bytes = _build_pdf_bytes(active_inst, series_list)
+            st.session_state["_lab1_pdf_bytes"] = pdf_bytes
+    pdf_bytes = st.session_state.get("_lab1_pdf_bytes")
+    if pdf_bytes is not None:
+        st.download_button(
+            label="Download PDF",
+            data=pdf_bytes,
+            file_name="nla_lab_results.pdf",
+            mime="application/pdf",
+        )
+        st.caption("Includes: summary, A heatmap, condition number, residual, FEB, and backward error.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main display
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -861,9 +1115,7 @@ else:
         st.caption("Coming soon.")
     st.divider()
 
-    st.subheader("7. Summary")
-    st.caption("Coming soon.")
+    _render_section7(active_inst, series_list)
     st.divider()
 
-    st.subheader("8. Save results")
-    st.caption("Coming soon.")
+    _render_section8(active_inst, series_list)
