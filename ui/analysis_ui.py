@@ -86,16 +86,12 @@ def _annotate_fmt(data: np.ndarray) -> str:
 
 def _heatmap_norm_and_cmap(data: np.ndarray):
     """
-    Choose norm + colormap based on the sign structure of data.
+    Choose norm + colormap based on sign structure of data.
 
-    - Mixed-sign  → SymLogNorm(vmin=-absmax, vmax=absmax) + diverging cmap
-                    (zero = white; red = positive, blue = negative)
-    - All positive → SymLogNorm(vmin=0, vmax=absmax)       + 'plasma'
-    - All negative → SymLogNorm(vmin=-absmax, vmax=0)      + 'plasma_r'
-    - All zero     → returns (None, 'plasma', 'value')
-
-    Using the full colormap range for single-sign data means every order of
-    magnitude gets equal visual weight, eliminating the "all one shade" problem.
+    vmax is anchored at the 99th percentile of |nonzero| values so that
+    a few extreme outliers don't compress the rest of the data into one shade.
+    linthresh (the linear/white zone for SymLogNorm) is set to 0.1% of vmax,
+    keeping zeros visually distinct while giving the main body full log contrast.
 
     Returns (norm_or_None, cmap, cbar_label).
     """
@@ -104,28 +100,31 @@ def _heatmap_norm_and_cmap(data: np.ndarray):
     if finite.size == 0:
         return None, "plasma", "value"
 
-    absmax = float(np.max(np.abs(finite)))
-    if absmax == 0:
+    nz_abs = np.abs(finite[finite != 0])
+    if nz_abs.size == 0:
         return None, "plasma", "value"
 
-    linthresh  = max(absmax * 1e-3, tiny)
-    has_pos    = bool(np.any(finite > 0))
-    has_neg    = bool(np.any(finite < 0))
+    vmax      = float(np.percentile(nz_abs, 99))
+    if vmax == 0:
+        vmax  = float(nz_abs.max())
+    linthresh = max(vmax * 1e-3, tiny)
+
+    has_pos = bool(np.any(finite > 0))
+    has_neg = bool(np.any(finite < 0))
 
     if has_pos and has_neg:
-        norm  = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
-                                   vmin=-absmax, vmax=absmax, base=10)
-        return norm, _diverging_cmap(), "value (symlog)"
+        norm = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
+                                  vmin=-vmax, vmax=vmax, base=10)
+        return norm, _diverging_cmap(), "value (symlog, 99th pct)"
 
     if has_pos:
-        norm  = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
-                                   vmin=0, vmax=absmax, base=10)
-        return norm, "plasma", "value (log)"
+        norm = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
+                                  vmin=0, vmax=vmax, base=10)
+        return norm, "plasma", "value (log, 99th pct)"
 
-    # all non-positive
-    norm  = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
-                               vmin=-absmax, vmax=0, base=10)
-    return norm, "plasma_r", "−value (log)"
+    norm = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
+                              vmin=-vmax, vmax=0, base=10)
+    return norm, "plasma_r", "−value (log, 99th pct)"
 
 
 def _symlog_norm(data: np.ndarray):
