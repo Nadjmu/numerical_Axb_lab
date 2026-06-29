@@ -74,11 +74,6 @@ def _diverging_cmap():
     return sns.diverging_palette(220, 20, as_cmap=True)
 
 
-def _sequential_cmap():
-    """Sequential colormap for non-negative data (e.g. vector magnitudes)."""
-    return "viridis"
-
-
 def _annotate_fmt(data: np.ndarray) -> str:
     """Choose annotation format based on data magnitude."""
     absmax = np.nanmax(np.abs(data))
@@ -89,13 +84,52 @@ def _annotate_fmt(data: np.ndarray) -> str:
     return ".3f"
 
 
+def _heatmap_norm_and_cmap(data: np.ndarray):
+    """
+    Choose norm + colormap based on the sign structure of data.
+
+    - Mixed-sign  → SymLogNorm(vmin=-absmax, vmax=absmax) + diverging cmap
+                    (zero = white; red = positive, blue = negative)
+    - All positive → SymLogNorm(vmin=0, vmax=absmax)       + 'plasma'
+    - All negative → SymLogNorm(vmin=-absmax, vmax=0)      + 'plasma_r'
+    - All zero     → returns (None, 'plasma', 'value')
+
+    Using the full colormap range for single-sign data means every order of
+    magnitude gets equal visual weight, eliminating the "all one shade" problem.
+
+    Returns (norm_or_None, cmap, cbar_label).
+    """
+    tiny   = np.finfo(float).tiny * 10
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return None, "plasma", "value"
+
+    absmax = float(np.max(np.abs(finite)))
+    if absmax == 0:
+        return None, "plasma", "value"
+
+    linthresh  = max(absmax * 1e-3, tiny)
+    has_pos    = bool(np.any(finite > 0))
+    has_neg    = bool(np.any(finite < 0))
+
+    if has_pos and has_neg:
+        norm  = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
+                                   vmin=-absmax, vmax=absmax, base=10)
+        return norm, _diverging_cmap(), "value (symlog)"
+
+    if has_pos:
+        norm  = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
+                                   vmin=0, vmax=absmax, base=10)
+        return norm, "plasma", "value (log)"
+
+    # all non-positive
+    norm  = mcolors.SymLogNorm(linthresh=linthresh, linscale=0.5,
+                               vmin=-absmax, vmax=0, base=10)
+    return norm, "plasma_r", "−value (log)"
+
+
 def _symlog_norm(data: np.ndarray):
-    """
-    SymLogNorm centred at zero.
-    Linear in [-linthresh, linthresh] so exact zeros read as white;
-    log-scaled outside so order-of-magnitude differences get strong colour contrast.
-    Returns (norm, absmax).  norm is None when the data is all-zero.
-    """
+    """Legacy helper used by PDF builder — returns (norm, absmax)."""
     absmax = float(np.nanmax(np.abs(data)))
     if absmax == 0:
         return None, 1.0
@@ -156,22 +190,20 @@ def render_heatmap(label: str, arr: np.ndarray) -> None:
         axes = [axes]
 
     for ax, (part_label, data) in zip(axes, parts):
-        norm, absmax = _symlog_norm(data)
-        fmt          = _annotate_fmt(data) if annot else ""
-        norm_kw      = ({"norm": norm}
-                        if norm is not None
-                        else {"center": 0, "vmin": -absmax, "vmax": absmax})
+        norm, cmap, cbar_label = _heatmap_norm_and_cmap(data)
+        fmt     = _annotate_fmt(data) if annot else ""
+        norm_kw = {"norm": norm} if norm is not None else {"vmin": 0, "vmax": 1}
         sns.heatmap(
             data,
             ax          = ax,
-            cmap        = _diverging_cmap(),
+            cmap        = cmap,
             annot       = annot,
             fmt         = fmt,
             annot_kws   = {"size": max(6, min(10, int(80 / max(m, n))))},
             linewidths  = 0.4 if m <= 40 else 0.0,
             linecolor   = "#cccccc",
             square      = True,
-            cbar_kws    = {"shrink": 0.75, "label": "value (log scale)"},
+            cbar_kws    = {"shrink": 0.75, "label": cbar_label},
             xticklabels = n <= 30,
             yticklabels = m <= 30,
             **norm_kw,
@@ -207,14 +239,12 @@ def render_vector_heatmap(label: str, arr: np.ndarray) -> None:
     if m > _HEATMAP_MAX:
         fig, ax  = plt.subplots(figsize=(1.2, 5))
         data_2d  = arr[:_HEATMAP_MAX].reshape(-1, 1)
-        norm, _  = _symlog_norm(data_2d)
-        norm_kw  = ({"norm": norm} if norm is not None
-                    else {"center": 0, "vmin": -float(np.nanmax(np.abs(data_2d))) or 1.0,
-                          "vmax":  float(np.nanmax(np.abs(data_2d))) or 1.0})
+        norm, cmap, cbar_label = _heatmap_norm_and_cmap(data_2d)
+        norm_kw  = {"norm": norm} if norm is not None else {"vmin": 0, "vmax": 1}
         sns.heatmap(
-            data_2d, ax=ax, cmap=_diverging_cmap(),
+            data_2d, ax=ax, cmap=cmap,
             annot=False, linewidths=0.0, square=False,
-            cbar_kws={"shrink": 0.6, "label": "value (log scale)"},
+            cbar_kws={"shrink": 0.6, "label": cbar_label},
             xticklabels=False, yticklabels=False,
             **norm_kw,
         )
@@ -225,11 +255,10 @@ def render_vector_heatmap(label: str, arr: np.ndarray) -> None:
         plt.close(fig)
         return
 
-    annot        = m <= _ANNOT_MAX
-    fmt          = _annotate_fmt(arr) if annot else ""
-    norm, absmax = _symlog_norm(arr.reshape(-1, 1))
-    norm_kw      = ({"norm": norm} if norm is not None
-                    else {"center": 0, "vmin": -absmax, "vmax": absmax})
+    annot                    = m <= _ANNOT_MAX
+    fmt                      = _annotate_fmt(arr) if annot else ""
+    norm, cmap, cbar_label   = _heatmap_norm_and_cmap(arr.reshape(-1, 1))
+    norm_kw                  = {"norm": norm} if norm is not None else {"vmin": 0, "vmax": 1}
 
     cell_h = max(0.35, min(0.7, 6.0 / m))
     fig_h  = min(m * cell_h + 1.0, 9.0)
@@ -239,14 +268,14 @@ def render_vector_heatmap(label: str, arr: np.ndarray) -> None:
     sns.heatmap(
         arr.reshape(-1, 1),
         ax          = ax,
-        cmap        = _diverging_cmap(),
+        cmap        = cmap,
         annot       = annot,
         fmt         = fmt,
         annot_kws   = {"size": max(6, min(9, int(60 / m)))},
         linewidths  = 0.4 if m <= 40 else 0.0,
         linecolor   = "#cccccc",
         square      = False,
-        cbar_kws    = {"shrink": 0.6, "label": "value (log scale)"},
+        cbar_kws    = {"shrink": 0.6, "label": cbar_label},
         xticklabels = False,
         yticklabels = True if m <= 30 else False,
         **norm_kw,
