@@ -158,22 +158,21 @@ def render_heatmap(label: str, arr: np.ndarray) -> None:
     m, n   = arr.shape
 
     if m > _HEATMAP_MAX or n > _HEATMAP_MAX:
+        # imshow is instant for large matrices and supports full colorbar + norm
         ncols = 2 if is_cx else 1
-        fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4))
+        fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
         if ncols == 1:
             axes = [axes]
         for ax, (part_label, data) in zip(axes, parts):
-            ax.spy(data, markersize=max(1, 180 // max(m, n)), color="#2166ac")
+            norm, cmap, cbar_label = _heatmap_norm_and_cmap(data)
+            im = ax.imshow(data, aspect="auto", cmap=cmap, norm=norm,
+                           interpolation="nearest", origin="upper")
+            fig.colorbar(im, ax=ax, shrink=0.8, label=cbar_label)
             ax.set_title(f"{label}  [{part_label}]" if is_cx else label,
                          fontsize=10, fontweight="bold", pad=8)
             ax.set_xlabel("column", fontsize=8)
             ax.set_ylabel("row",    fontsize=8)
-            ax.xaxis.set_label_position("bottom")
-            ax.xaxis.tick_bottom()
-        st.caption(
-            f"Matrix is {m} × {n} — showing non-zero pattern"
-            + ("  (Re | Im)." if is_cx else ".  Blue dot = non-zero, white = zero.")
-        )
+        st.caption(f"Matrix is {m} × {n} — colour = value magnitude (log scale).")
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
